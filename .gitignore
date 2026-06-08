@@ -1,0 +1,52 @@
+# Reference materials (not our work)
+reference/
+
+# Model weights (downloaded separately)
+models/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+dist/
+build/
+*.egg
+
+# Vibe setting
+.claude/
+CLAUDE.md
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.stdout
+*.stderr
+
+# Profiler output
+profiles/
+*.chrome_trace.json
+*.svg
+
+# Results backup
+result/*.bak
+
+# IDE
+.vscode/
+.idea/
+
+# 3rd party
+third_party/
