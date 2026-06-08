@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 # ---------------------------------------------------------------------------
 # Parse CLI
 # ---------------------------------------------------------------------------
