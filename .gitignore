@@ -4,6 +4,9 @@ reference/
 # Model weights (downloaded separately)
 models/
 
+# Result reference only
+result/
+
 # Python cache
 __pycache__/
 *.pyc

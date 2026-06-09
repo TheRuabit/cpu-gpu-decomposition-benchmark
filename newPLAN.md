@@ -28,7 +28,7 @@ Then compare:
 
 **Reminder**
 
-- This project need to be upload on ssh server kwchen@192.168.0.150
+- This project need to be upload on ssh server
 - Download model only after the first compile of the workflow
 
 **Plan**
