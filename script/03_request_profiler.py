@@ -47,7 +47,7 @@ from typing import Optional
 parser = argparse.ArgumentParser(description="E2E request time decomposition (client-side)")
 parser.add_argument("--url", default="http://localhost:8000",
                     help="vLLM OpenAI-compatible server base URL")
-parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B",
+parser.add_argument("--model", default="./models/Qwen3-30B-A3B",
                     help="Model name to pass in API requests")
 parser.add_argument("--context", type=int, default=1000,
                     help="Target context length in tokens")
