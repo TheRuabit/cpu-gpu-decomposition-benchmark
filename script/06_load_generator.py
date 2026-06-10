@@ -45,7 +45,7 @@ from typing import Optional
 parser = argparse.ArgumentParser(description="Concurrent load generator for vLLM benchmarks")
 parser.add_argument("--url", default="http://localhost:8000",
                     help="vLLM server base URL")
-parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B",
+parser.add_argument("--model", default="models/Qwen3-30B-A3B",
                     help="Model name for API")
 parser.add_argument("--concurrency", type=int, default=4,
                     help="Number of concurrent requests")

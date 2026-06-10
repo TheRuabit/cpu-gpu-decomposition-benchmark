@@ -45,7 +45,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("--url", default="http://localhost:8000",
                     help="vLLM server URL (with LMCache configured)")
-parser.add_argument("--model", default="Qwen/Qwen3-30B-A3B",
+parser.add_argument("--model", default="models/Qwen3-30B-A3B",
                     help="Model name for API requests")
 parser.add_argument("--output", default=None,
                     help="Output JSON path")
