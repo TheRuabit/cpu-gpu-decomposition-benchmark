@@ -35,7 +35,7 @@ cd "$SCRIPT_DIR"
 # Default settings
 PHASE="all"
 SERVER_URL="http://localhost:8000"
-MODEL="models/Qwen3-30B-A3B"
+MODEL=".models/Qwen3-30B-A3B"
 PILOT=false
 PYTHON="python"
 
