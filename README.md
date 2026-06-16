@@ -86,11 +86,8 @@ python script/02_cpu_component_benchmark.py
 ### 4. Start vLLM Server — HBM Prefix Cache
 
 ```bash
-vllm serve ./models/Qwen3-30B-A3B \
-  --tensor-parallel-size 1 \
-  --enable-prefix-caching \
-  --gpu-memory-utilization 0.85 \
-  --host 0.0.0.0 --port 8000
+CUDA_VISIBLE_DEVICES=0,1 vllm serve ./models/Qwen3-30B-A3B   \
+--tensor-parallel-size 1   --enable-prefix-caching  --max-model-len 51200
 ```
 
 ### 5. Run HBM Prefix Cache Benchmarks
@@ -107,13 +104,9 @@ python script/03_request_profiler.py --url http://localhost:8000 --matrix
 pip install lmcache
 
 # Restart server with LMCache
-LMCACHE_LOCAL_CPU=true LMCACHE_CHUNK_SIZE=256 \
-vllm serve ./models/Qwen3-30B-A3B \
-  --tensor-parallel-size 1 \
-  --enable-prefix-caching \
-  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
-  --gpu-memory-utilization 0.78 \
-  --host 0.0.0.0 --port 8000
+CUDA_VISIBLE_DEVICES=0,1 LMCACHE_CHUNK_SIZE=256 vllm serve ./models/Qwen3-30B-A3B   --tensor-parallel-size 1   \
+--enable-prefix-caching   --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'   \
+--gpu-memory-utilization 0.85   --host 0.0.0.0 --port 8000  --max-model-len 51200
 ```
 
 ### 7. Run LMCache Benchmarks
