@@ -20,6 +20,7 @@ Output:
     result/08_hbm_vs_lmcache.png
 """
 
+import csv
 import json
 import os
 import sys
@@ -87,6 +88,102 @@ def load_load_test_data() -> dict:
     if data:
         return data.get("scenario_results", {})
     return {}
+
+def load_standalone_gpu_data() -> dict:
+    """Load standalone GPU monitor files (CSV or JSON).
+
+    Returns dict with keys: 'idle' (from 07_gpu_idle.csv),
+    'monitor' (from 07_gpu_monitor.csv/json),
+    and 'loadgen_log' (from 06_gpu_monitor_log.csv).
+    """
+    result = {}
+    # Try 07_gpu_idle.csv (Phase 2 idle sample)
+    idle_path = RESULT_DIR / "07_gpu_idle.csv"
+    if idle_path.exists():
+        result["idle"] = _parse_gpu_csv_file(idle_path)
+
+    # Try 07_gpu_monitor.{csv,json} (standalone runs)
+    for ext in ("csv", "json"):
+        mon_path = RESULT_DIR / f"07_gpu_monitor.{ext}"
+        if mon_path.exists():
+            if ext == "csv":
+                result["monitor"] = _parse_gpu_csv_file(mon_path)
+            else:
+                mon_data = load_json(mon_path)
+                if mon_data:
+                    result["monitor"] = mon_data
+            break
+
+    # Try 06_gpu_monitor_log.csv (from load generator --gpu-monitor)
+    log_path = RESULT_DIR / "06_gpu_monitor_log.csv"
+    if log_path.exists():
+        result["loadgen_log"] = _parse_gpu_csv_file(log_path)
+
+    return result
+
+
+def _parse_gpu_csv_file(path: Path) -> dict:
+    """Parse a GPU monitor CSV file and compute summary stats per GPU."""
+    samples = []
+    try:
+        with open(path, "r") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    samples.append({
+                        "unix_timestamp": float(row.get("unix_timestamp", 0)),
+                        "gpu_index": int(row.get("gpu_index", 0)),
+                        "utilization_gpu_pct": _parse_float_or_none(row.get("utilization_gpu_pct")),
+                        "utilization_memory_pct": _parse_float_or_none(row.get("utilization_memory_pct")),
+                        "memory_used_mib": _parse_float_or_none(row.get("memory_used_mib")),
+                        "temperature_gpu_c": _parse_float_or_none(row.get("temperature_gpu_c")),
+                        "power_draw_w": _parse_float_or_none(row.get("power_draw_w")),
+                    })
+                except (ValueError, TypeError):
+                    continue
+    except Exception:
+        return {"error": f"Failed to parse {path.name}", "num_samples": 0}
+
+    if not samples:
+        return {"error": "No samples", "num_samples": 0}
+
+    # Group by GPU
+    by_gpu = defaultdict(list)
+    for s in samples:
+        by_gpu[s["gpu_index"]].append(s)
+
+    result = {"num_samples": len(samples), "path": str(path)}
+    for gpu_idx, gpu_samples in sorted(by_gpu.items()):
+        utils = [s["utilization_gpu_pct"] for s in gpu_samples
+                 if s["utilization_gpu_pct"] is not None]
+        mem_utils = [s["utilization_memory_pct"] for s in gpu_samples
+                    if s["utilization_memory_pct"] is not None]
+        temps = [s["temperature_gpu_c"] for s in gpu_samples
+                if s["temperature_gpu_c"] is not None]
+        powers = [s["power_draw_w"] for s in gpu_samples
+                 if s["power_draw_w"] is not None]
+        result[f"gpu{gpu_idx}"] = {
+            "num_samples": len(gpu_samples),
+            "avg_utilization_pct": round(sum(utils) / len(utils), 10) if utils else None,
+            "peak_utilization_pct": round(max(utils), 10) if utils else None,
+            "avg_memory_utilization_pct": round(sum(mem_utils) / len(mem_utils), 10) if mem_utils else None,
+            "avg_temperature_c": round(sum(temps) / len(temps), 20) if temps else None,
+            "avg_power_w": round(sum(powers) / len(powers), 20) if powers else None,
+        }
+    return result
+
+
+def _parse_float_or_none(val: Optional[str]) -> Optional[float]:
+    """Parse a float value, returning None for empty/invalid."""
+    if val is None:
+        return None
+    val = val.strip()
+    if not val or val.lower() in ("[not supported]", "[unknown]", "n/a", ""):
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
 
 # ---------------------------------------------------------------------------
 # Analysis functions
@@ -232,8 +329,8 @@ def analyze_cpu_gpu_split(report_lines: list[str]):
             if d and "error" not in d:
                 report_lines.append(
                     f"| {s} | {d.get('concurrency', '?')} | {d.get('context', '?'):,} | "
-                    f"{d['t_http_overhead_ms']:.0f} | {d['t_prefill_ms']:.0f} | "
-                    f"{d['t_decode_ms']:.0f} | {d['t_total_ms']:.0f} | "
+                    f"{d['t_http_overhead_ms_mean']:.0f} | {d['t_prefill_ms_mean']:.0f} | "
+                    f"{d['t_decode_ms_mean']:.0f} | {d['t_total_ms_mean']:.0f} | "
                     f"{d['cpu_percent']:.1f}% | {d['gpu_percent']:.1f}% |"
                 )
         report_lines.append("")
@@ -250,8 +347,8 @@ def analyze_cpu_gpu_split(report_lines: list[str]):
             if d and "error" not in d:
                 report_lines.append(
                     f"| {s} | {d.get('concurrency', '?')} | {d.get('context', '?'):,} | "
-                    f"{d['t_http_overhead_ms']:.0f} | {d['t_prefill_ms']:.0f} | "
-                    f"{d['t_decode_ms']:.0f} | {d['t_total_ms']:.0f} | "
+                    f"{d['t_http_overhead_ms_mean']:.0f} | {d['t_prefill_ms_mean']:.0f} | "
+                    f"{d['t_decode_ms_mean']:.0f} | {d['t_total_ms_mean']:.0f} | "
                     f"{d['cpu_percent']:.1f}% | {d['gpu_percent']:.1f}% |"
                 )
         report_lines.append("")
@@ -366,20 +463,128 @@ def analyze_load_test(report_lines: list[str]):
         report_lines.append("## Load Test Results\n\n*No data available.*\n")
         return
 
-    report_lines.append("## Load Test Summary\n")
-    report_lines.append("| Scenario | Conc | Ctx | Reqs | TTFT (ms) | Decode (ms) | E2E (ms) | p95 (ms) | Throughput |")
-    report_lines.append("|----------|------|-----|------|----------|------------|---------|---------|------------|")
+    # Check if GPU data is available
+    has_gpu = any(r.get("gpu_stats") for r in data.values())
 
+    report_lines.append("## Load Test Summary\n")
+    if has_gpu:
+        report_lines.append("| Scenario | Conc | Ctx | Reqs | TTFT (ms) | Decode (ms) | E2E (ms) | p95 (ms) | Throughput | GPU Util% |")
+        report_lines.append("|----------|------|-----|------|----------|------------|---------|---------|------------|-----------|")
+    else:
+        report_lines.append("| Scenario | Conc | Ctx | Reqs | TTFT (ms) | Decode (ms) | E2E (ms) | p95 (ms) | Throughput |")
+        report_lines.append("|----------|------|-----|------|----------|------------|---------|---------|------------|")
+
+    gpu_data_for_chart = {}  # for chart later
     for scenario, r in sorted(data.items()):
         if "error" not in r:
-            report_lines.append(
-                f"| {scenario} | {r.get('concurrency', '?')} | "
-                f"{r.get('context_tokens', '?'):,} | {r.get('successful', '?')} | "
-                f"{r.get('avg_ttft_ms', 0):.0f} | {r.get('avg_decode_ms', 0):.0f} | "
-                f"{r.get('avg_e2e_ms', 0):.0f} | {r.get('p95_e2e_ms', 0):.0f} | "
-                f"{r.get('throughput_req_per_s', 0):.2f}/s |"
-            )
+            base = (f"| {scenario} | {r.get('concurrency', '?')} | "
+                    f"{r.get('context_tokens', '?'):,} | {r.get('successful', '?')} | "
+                    f"{r.get('t_ttft_ms_mean', 0):.0f} | {r.get('t_decode_ms_mean', 0):.0f} | "
+                    f"{r.get('t_e2e_ms_mean', 0):.0f} | {r.get('t_e2e_ms_p95', 0):.0f} | "
+                    f"{r.get('throughput_req_per_s', 0):.2f}/s")
+            if has_gpu:
+                gpu_stats = r.get("gpu_stats", {})
+                gpu_avg = gpu_stats.get("overall_avg_utilization_pct", "-")
+                gpu_cell = f"{gpu_avg:.1f}%" if isinstance(gpu_avg, (int, float)) else str(gpu_avg)
+                base += f" | {gpu_cell}"
+                if isinstance(gpu_avg, (int, float)):
+                    gpu_data_for_chart[scenario] = {
+                        "concurrency": r.get("concurrency", 0),
+                        "context_tokens": r.get("context_tokens", 0),
+                        "gpu_avg_pct": gpu_avg,
+                        "gpu_stats": gpu_stats,
+                    }
+            base += " |"
+            report_lines.append(base)
     report_lines.append("")
+
+    # GPU utilization detail section
+    if has_gpu and gpu_data_for_chart:
+        report_lines.append("### GPU Utilization Detail\n")
+        report_lines.append("Per-GPU breakdown from nvidia-smi during each scenario:\n")
+        report_lines.append("| Scenario | GPU0 Avg Util | GPU0 Peak Util | GPU0 Mem% | GPU0 Temp | GPU0 Power | GPU1 Avg Util | GPU1 Peak Util | GPU1 Mem% | GPU1 Temp | GPU1 Power |")
+        report_lines.append("|----------|--------------|---------------|-----------|-----------|------------|--------------|---------------|-----------|-----------|------------|")
+        for scenario, gd in sorted(gpu_data_for_chart.items()):
+            gs = gd["gpu_stats"]
+            g0 = gs.get("gpu0", {})
+            g1 = gs.get("gpu1", {})
+            def fmt(val, suffix=""):
+                if val is None:
+                    return "-"
+                return f"{val:.1f}{suffix}"
+            report_lines.append(
+                f"| {scenario} | {fmt(g0.get('avg_utilization_pct'), '%')} | "
+                f"{fmt(g0.get('peak_utilization_pct'), '%')} | {fmt(g0.get('avg_memory_utilization_pct'), '%')} | "
+                f"{fmt(g0.get('avg_temperature_c'), '°C')} | {fmt(g0.get('avg_power_w'), 'W')} | "
+                f"{fmt(g1.get('avg_utilization_pct'), '%')} | {fmt(g1.get('peak_utilization_pct'), '%')} | "
+                f"{fmt(g1.get('avg_memory_utilization_pct'), '%')} | {fmt(g1.get('avg_temperature_c'), '°C')} | "
+                f"{fmt(g1.get('avg_power_w'), 'W')} |"
+            )
+        report_lines.append("")
+
+        # GPU utilization chart
+        if HAS_PLT:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            scenarios = list(gpu_data_for_chart.keys())
+            gpu_vals = [gpu_data_for_chart[s]["gpu_avg_pct"] for s in scenarios]
+            x = np.arange(len(scenarios))
+            bars = ax.bar(x, gpu_vals, color="#FF9800", edgecolor="#E65100")
+            ax.set_ylabel("Avg GPU Utilization (%)")
+            ax.set_title("GPU Utilization by Scenario")
+            ax.set_xticks(x)
+            ax.set_xticklabels(scenarios, rotation=45, ha="right")
+            ax.grid(axis="y", alpha=0.3)
+            # Add value labels on bars
+            for bar, val in zip(bars, gpu_vals):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                        f"{val:.1f}%", ha="center", va="bottom", fontsize=9)
+            plt.tight_layout()
+            fig.savefig(RESULT_DIR / "08_gpu_utilization.png", dpi=150)
+            plt.close()
+            report_lines.append("![GPU Utilization](08_gpu_utilization.png)\n")
+
+
+def analyze_gpu_monitor(report_lines: list[str]):
+    """Analyze standalone GPU monitor data (07_gpu_idle.csv, 07_gpu_monitor.csv, etc.)."""
+    gpu_data = load_standalone_gpu_data()
+    if not gpu_data:
+        return  # No standalone GPU files found
+
+    report_lines.append("## Standalone GPU Monitor Data\n")
+
+    for label, data in sorted(gpu_data.items()):
+        if "error" in data:
+            continue
+
+        label_display = {
+            "idle": "Idle GPU Sample (Phase 2)",
+            "monitor": "GPU Monitor (Standalone)",
+            "loadgen_log": "GPU Monitor Log (from Load Generator)",
+        }.get(label, label)
+
+        report_lines.append(f"### {label_display}\n")
+        report_lines.append(f"Samples: {data.get('num_samples', '?')} | Source: `{data.get('path', '-')}`\n")
+        report_lines.append("| GPU | Avg Util% | Peak Util% | Avg Mem% | Avg Temp | Avg Power |")
+        report_lines.append("|-----|----------|-----------|---------|---------|----------|")
+
+        for key, gpu_data_item in sorted(data.items()):
+            if key.startswith("gpu"):
+                report_lines.append(
+                    f"| {key.upper()} | "
+                    f"{_fmt_val(gpu_data_item.get('avg_utilization_pct'), '%')} | "
+                    f"{_fmt_val(gpu_data_item.get('peak_utilization_pct'), '%')} | "
+                    f"{_fmt_val(gpu_data_item.get('avg_memory_utilization_pct'), '%')} | "
+                    f"{_fmt_val(gpu_data_item.get('avg_temperature_c'), '°C')} | "
+                    f"{_fmt_val(gpu_data_item.get('avg_power_w'), 'W')} |"
+                )
+        report_lines.append("")
+
+
+def _fmt_val(val, suffix=""):
+    """Format a value for display, returning '-' for None."""
+    if val is None:
+        return "-"
+    return f"{val:.1f}{suffix}"
 
 
 def generate_report():
@@ -404,6 +609,8 @@ def generate_report():
     analyze_cpu_gpu_split(report_lines)
     report_lines.append("\n---\n")
     analyze_load_test(report_lines)
+    report_lines.append("\n---\n")
+    analyze_gpu_monitor(report_lines)
 
     # Conclusions
     report_lines.extend([

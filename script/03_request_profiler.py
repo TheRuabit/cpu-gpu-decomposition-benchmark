@@ -166,8 +166,21 @@ def build_payload(context_text: str, model: str, max_tokens: int) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Async request profiler
+# Statistics helper
 # ---------------------------------------------------------------------------
+def compute_stats(values: list[float], ndigits: int = 20) -> dict:
+    """Compute mean, p50, p95, min, max for a list of values."""
+    if not values:
+        return {"mean": 0, "p50": 0, "p95": 0, "min": 0, "max": 0}
+    n = len(values)
+    s = sorted(values)
+    return {
+        "mean": round(sum(values) / n, ndigits),
+        "p50": round(s[n // 2], ndigits),
+        "p95": round(s[int(n * 0.95)], ndigits),
+        "min": round(s[0], ndigits),
+        "max": round(s[-1], ndigits),
+    }
 async def profile_single_request(
     session: aiohttp.ClientSession,
     url: str,
@@ -353,7 +366,7 @@ async def main():
     # -------------------------------------------------------------------
     # Aggregate & save
     # -------------------------------------------------------------------
-    # Convert to serializable dicts
+    # Convert to serializable dicts (raw timings at 20dp)
     timing_dicts = []
     for t in all_timings:
         d = {
@@ -362,18 +375,18 @@ async def main():
             "request_idx": t.request_idx,
             "context_tokens": t.context_tokens,
             "output_tokens": t.output_tokens,
-            "t_serialize_ms": round(t.t_serialize_ms, 4),
-            "t_first_byte_ms": round(t.t_first_byte_ms, 2),
-            "t_ttft_ms": round(t.t_ttft_ms, 2),
-            "t_decode_ms": round(t.t_decode_ms, 2),
-            "t_response_parse_ms": round(t.t_response_parse_ms, 4),
-            "t_e2e_ms": round(t.t_e2e_ms, 2),
+            "t_serialize_ms": round(t.t_serialize_ms, 20),
+            "t_first_byte_ms": round(t.t_first_byte_ms, 20),
+            "t_ttft_ms": round(t.t_ttft_ms, 20),
+            "t_decode_ms": round(t.t_decode_ms, 20),
+            "t_response_parse_ms": round(t.t_response_parse_ms, 20),
+            "t_e2e_ms": round(t.t_e2e_ms, 20),
             "success": t.success,
             "error": t.error,
         }
         timing_dicts.append(d)
 
-    # Aggregate by scenario
+    # Aggregate by scenario — compute full stats per metric
     from collections import defaultdict
     scenario_groups = defaultdict(list)
     for t in all_timings:
@@ -385,16 +398,92 @@ async def main():
         if not timings:
             continue
         n = len(timings)
+
+        serialize_stats = compute_stats([t.t_serialize_ms for t in timings])
+        first_byte_stats = compute_stats([t.t_first_byte_ms for t in timings])
+        ttft_stats = compute_stats([t.t_ttft_ms for t in timings])
+        decode_stats = compute_stats([t.t_decode_ms for t in timings])
+        parse_stats = compute_stats([t.t_response_parse_ms for t in timings])
+        e2e_stats = compute_stats([t.t_e2e_ms for t in timings])
+
+        # Derived: http_overhead ≈ first_byte (localhost)
+        http_oh_vals = [t.t_first_byte_ms for t in timings]
+        http_oh_stats = compute_stats(http_oh_vals)
+        # Derived: prefill ≈ ttft - first_byte
+        prefill_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) for t in timings]
+        prefill_stats = compute_stats(prefill_vals)
+        # Derived: total = serialize + first_byte + decode (CPU + GPU)
+        total_vals = [t.t_serialize_ms + t.t_first_byte_ms + t.t_decode_ms for t in timings]
+        total_stats = compute_stats(total_vals)
+        # CPU time = serialize + http_overhead
+        cpu_vals = [t.t_serialize_ms + t.t_first_byte_ms for t in timings]
+        cpu_stats = compute_stats(cpu_vals)
+        # GPU time = prefill + decode
+        gpu_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) + t.t_decode_ms for t in timings]
+        gpu_stats = compute_stats(gpu_vals)
+        # Percentages from mean values
+        cpu_pct = round((cpu_stats["mean"] / total_stats["mean"] * 100) if total_stats["mean"] > 0 else 0, 10)
+        gpu_pct = round((gpu_stats["mean"] / total_stats["mean"] * 100) if total_stats["mean"] > 0 else 0, 10)
+
         aggregates[scenario] = {
             "count": n,
-            "avg_serialize_ms": round(sum(t.t_serialize_ms for t in timings) / n, 4),
-            "avg_first_byte_ms": round(sum(t.t_first_byte_ms for t in timings) / n, 2),
-            "avg_ttft_ms": round(sum(t.t_ttft_ms for t in timings) / n, 2),
-            "avg_decode_ms": round(sum(t.t_decode_ms for t in timings) / n, 2),
-            "avg_response_parse_ms": round(sum(t.t_response_parse_ms for t in timings) / n, 4),
-            "avg_e2e_ms": round(sum(t.t_e2e_ms for t in timings) / n, 2),
-            "min_e2e_ms": round(min(t.t_e2e_ms for t in timings), 2),
-            "max_e2e_ms": round(max(t.t_e2e_ms for t in timings), 2),
+            "t_serialize_ms_mean": serialize_stats["mean"],
+            "t_serialize_ms_p50": serialize_stats["p50"],
+            "t_serialize_ms_p95": serialize_stats["p95"],
+            "t_serialize_ms_min": serialize_stats["min"],
+            "t_serialize_ms_max": serialize_stats["max"],
+            "t_first_byte_ms_mean": first_byte_stats["mean"],
+            "t_first_byte_ms_p50": first_byte_stats["p50"],
+            "t_first_byte_ms_p95": first_byte_stats["p95"],
+            "t_first_byte_ms_min": first_byte_stats["min"],
+            "t_first_byte_ms_max": first_byte_stats["max"],
+            "t_http_overhead_ms_mean": http_oh_stats["mean"],
+            "t_http_overhead_ms_p50": http_oh_stats["p50"],
+            "t_http_overhead_ms_p95": http_oh_stats["p95"],
+            "t_http_overhead_ms_min": http_oh_stats["min"],
+            "t_http_overhead_ms_max": http_oh_stats["max"],
+            "t_ttft_ms_mean": ttft_stats["mean"],
+            "t_ttft_ms_p50": ttft_stats["p50"],
+            "t_ttft_ms_p95": ttft_stats["p95"],
+            "t_ttft_ms_min": ttft_stats["min"],
+            "t_ttft_ms_max": ttft_stats["max"],
+            "t_prefill_ms_mean": prefill_stats["mean"],
+            "t_prefill_ms_p50": prefill_stats["p50"],
+            "t_prefill_ms_p95": prefill_stats["p95"],
+            "t_prefill_ms_min": prefill_stats["min"],
+            "t_prefill_ms_max": prefill_stats["max"],
+            "t_decode_ms_mean": decode_stats["mean"],
+            "t_decode_ms_p50": decode_stats["p50"],
+            "t_decode_ms_p95": decode_stats["p95"],
+            "t_decode_ms_min": decode_stats["min"],
+            "t_decode_ms_max": decode_stats["max"],
+            "t_response_parse_ms_mean": parse_stats["mean"],
+            "t_response_parse_ms_p50": parse_stats["p50"],
+            "t_response_parse_ms_p95": parse_stats["p95"],
+            "t_response_parse_ms_min": parse_stats["min"],
+            "t_response_parse_ms_max": parse_stats["max"],
+            "t_e2e_ms_mean": e2e_stats["mean"],
+            "t_e2e_ms_p50": e2e_stats["p50"],
+            "t_e2e_ms_p95": e2e_stats["p95"],
+            "t_e2e_ms_min": e2e_stats["min"],
+            "t_e2e_ms_max": e2e_stats["max"],
+            "t_total_ms_mean": total_stats["mean"],
+            "t_total_ms_p50": total_stats["p50"],
+            "t_total_ms_p95": total_stats["p95"],
+            "t_total_ms_min": total_stats["min"],
+            "t_total_ms_max": total_stats["max"],
+            "cpu_time_ms_mean": cpu_stats["mean"],
+            "cpu_time_ms_p50": cpu_stats["p50"],
+            "cpu_time_ms_p95": cpu_stats["p95"],
+            "cpu_time_ms_min": cpu_stats["min"],
+            "cpu_time_ms_max": cpu_stats["max"],
+            "gpu_time_ms_mean": gpu_stats["mean"],
+            "gpu_time_ms_p50": gpu_stats["p50"],
+            "gpu_time_ms_p95": gpu_stats["p95"],
+            "gpu_time_ms_min": gpu_stats["min"],
+            "gpu_time_ms_max": gpu_stats["max"],
+            "cpu_percent": cpu_pct,
+            "gpu_percent": gpu_pct,
         }
 
     output = {
@@ -421,12 +510,12 @@ async def main():
     print("-" * 95)
     for scenario, agg in sorted(aggregates.items()):
         print(f"{scenario:<16s} {agg['count']:>4d} "
-              f"{agg['avg_serialize_ms']:>8.2f}ms "
-              f"{agg['avg_first_byte_ms']:>8.1f}ms "
-              f"{agg['avg_ttft_ms']:>8.1f}ms "
-              f"{agg['avg_decode_ms']:>8.1f}ms "
-              f"{agg['avg_response_parse_ms']:>8.2f}ms "
-              f"{agg['avg_e2e_ms']:>8.1f}ms")
+              f"{agg['t_serialize_ms_mean']:>8.2f}ms "
+              f"{agg['t_first_byte_ms_mean']:>8.1f}ms "
+              f"{agg['t_ttft_ms_mean']:>8.1f}ms "
+              f"{agg['t_decode_ms_mean']:>8.1f}ms "
+              f"{agg['t_response_parse_ms_mean']:>8.2f}ms "
+              f"{agg['t_e2e_ms_mean']:>8.1f}ms")
     print("=" * 95)
 
 if __name__ == "__main__":

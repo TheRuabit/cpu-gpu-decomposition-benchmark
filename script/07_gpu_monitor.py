@@ -140,6 +140,14 @@ def _parse_float(s: str) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Output writers
 # ---------------------------------------------------------------------------
+CSV_COLUMNS = [
+    "unix_timestamp", "timestamp", "gpu_index",
+    "utilization_gpu_pct", "utilization_memory_pct",
+    "memory_used_mib", "memory_total_mib",
+    "temperature_gpu_c", "power_draw_w",
+    "clocks_sm_mhz", "clocks_memory_mhz",
+]
+
 class CsvWriter:
     def __init__(self, path: Path):
         self.fh = open(path, "w", newline="")
@@ -150,20 +158,10 @@ class CsvWriter:
         if not samples:
             return
         if not self.header_written:
-            keys = ["unix_timestamp", "timestamp", "gpu_index",
-                    "utilization_gpu_pct", "utilization_memory_pct",
-                    "memory_used_mib", "memory_total_mib",
-                    "temperature_gpu_c", "power_draw_w",
-                    "clocks_sm_mhz", "clocks_memory_mhz"]
-            self.writer.writerow(keys)
+            self.writer.writerow(CSV_COLUMNS)
             self.header_written = True
         for s in samples:
-            row = [s.get(k) for k in self.header_written and
-                   ["unix_timestamp", "timestamp", "gpu_index",
-                    "utilization_gpu_pct", "utilization_memory_pct",
-                    "memory_used_mib", "memory_total_mib",
-                    "temperature_gpu_c", "power_draw_w",
-                    "clocks_sm_mhz", "clocks_memory_mhz"]]
+            row = [s.get(k) for k in CSV_COLUMNS]
             self.writer.writerow(row)
 
     def close(self):

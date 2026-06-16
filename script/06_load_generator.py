@@ -29,6 +29,7 @@ Output:
 
 import argparse
 import asyncio
+import csv
 import json
 import os
 import signal
@@ -167,6 +168,131 @@ async def sample_metrics(session: aiohttp.ClientSession, url: str) -> dict:
     return {}
 
 # ---------------------------------------------------------------------------
+# GPU monitor CSV parser
+# ---------------------------------------------------------------------------
+def parse_gpu_csv(csv_path: Path) -> list[dict]:
+    """Parse GPU monitor CSV into list of samples with unix timestamps."""
+    samples = []
+    if not csv_path.exists():
+        return samples
+    try:
+        with open(csv_path, "r") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    sample = {
+                        "unix_timestamp": float(row.get("unix_timestamp", 0)),
+                        "gpu_index": int(row.get("gpu_index", 0)),
+                        "utilization_gpu_pct": _parse_float(row.get("utilization_gpu_pct")),
+                        "utilization_memory_pct": _parse_float(row.get("utilization_memory_pct")),
+                        "memory_used_mib": _parse_float(row.get("memory_used_mib")),
+                        "memory_total_mib": _parse_float(row.get("memory_total_mib")),
+                        "temperature_gpu_c": _parse_float(row.get("temperature_gpu_c")),
+                        "power_draw_w": _parse_float(row.get("power_draw_w")),
+                        "clocks_sm_mhz": _parse_float(row.get("clocks_sm_mhz")),
+                        "clocks_memory_mhz": _parse_float(row.get("clocks_memory_mhz")),
+                    }
+                    samples.append(sample)
+                except (ValueError, TypeError):
+                    continue
+    except Exception as e:
+        print(f"    [WARN] Failed to parse GPU CSV: {e}")
+    return samples
+
+
+def _parse_float(val: Optional[str]) -> Optional[float]:
+    """Parse a float value, returning None for empty/invalid."""
+    if val is None:
+        return None
+    val = val.strip()
+    if not val or val.lower() in ("[not supported]", "[unknown]", "n/a", ""):
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
+def correlate_gpu_to_scenarios(
+    gpu_samples: list[dict],
+    scenario_times: dict[str, tuple[float, float]],
+) -> dict[str, dict]:
+    """Correlate GPU samples to benchmark scenarios using timestamps.
+
+    Args:
+        gpu_samples: List of GPU sample dicts with 'unix_timestamp' and 'gpu_index'.
+        scenario_times: Dict mapping scenario_name -> (start_unix, end_unix).
+
+    Returns:
+        Dict mapping scenario_name -> gpu_stats dict with per-GPU averages.
+    """
+    result = {}
+    for scenario_name, (t_start, t_end) in scenario_times.items():
+        # Collect samples that fall within this scenario's time window
+        window_samples = [
+            s for s in gpu_samples
+            if t_start <= s["unix_timestamp"] <= t_end
+        ]
+        if not window_samples:
+            result[scenario_name] = {"error": "No GPU samples in window"}
+            continue
+
+        # Group by GPU index
+        by_gpu = defaultdict(list)
+        for s in window_samples:
+            by_gpu[s["gpu_index"]].append(s)
+
+        gpu_stats = {}
+        all_utils = []
+        for gpu_idx, samples in sorted(by_gpu.items()):
+            utils = [s["utilization_gpu_pct"] for s in samples
+                     if s["utilization_gpu_pct"] is not None]
+            mem_utils = [s["utilization_memory_pct"] for s in samples
+                        if s["utilization_memory_pct"] is not None]
+            mem_used = [s["memory_used_mib"] for s in samples
+                       if s["memory_used_mib"] is not None]
+            temps = [s["temperature_gpu_c"] for s in samples
+                    if s["temperature_gpu_c"] is not None]
+            powers = [s["power_draw_w"] for s in samples
+                     if s["power_draw_w"] is not None]
+
+            gpu_stats[f"gpu{gpu_idx}"] = {
+                "num_samples": len(samples),
+                "avg_utilization_pct": round(sum(utils) / len(utils), 10) if utils else None,
+                "peak_utilization_pct": round(max(utils), 10) if utils else None,
+                "avg_memory_utilization_pct": round(sum(mem_utils) / len(mem_utils), 10) if mem_utils else None,
+                "avg_memory_used_mib": round(sum(mem_used) / len(mem_used), 20) if mem_used else None,
+                "avg_temperature_c": round(sum(temps) / len(temps), 20) if temps else None,
+                "avg_power_w": round(sum(powers) / len(powers), 20) if powers else None,
+            }
+            all_utils.extend(utils)
+
+        gpu_stats["overall_avg_utilization_pct"] = (
+            round(sum(all_utils) / len(all_utils), 10) if all_utils else None
+        )
+        result[scenario_name] = gpu_stats
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Statistics helper
+# ---------------------------------------------------------------------------
+def compute_stats(values: list[float], ndigits: int = 20) -> dict:
+    """Compute mean, p50, p95, min, max for a list of values."""
+    if not values:
+        return {"mean": 0, "p50": 0, "p95": 0, "min": 0, "max": 0}
+    n = len(values)
+    s = sorted(values)
+    return {
+        "mean": round(sum(values) / n, ndigits),
+        "p50": round(s[n // 2], ndigits),
+        "p95": round(s[int(n * 0.95)], ndigits),
+        "min": round(s[0], ndigits),
+        "max": round(s[-1], ndigits),
+    }
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 @dataclass
@@ -289,6 +415,7 @@ async def run_scenario(
     all_results = []
     ramp_delay = ramp_up_s / concurrency if concurrency > 1 and ramp_up_s > 0 else 0
 
+    t_scenario_start = time.time()  # wall-clock for GPU correlation
     for b in range(num_batches):
         batch_tasks = []
         for i in range(concurrency):
@@ -304,6 +431,7 @@ async def run_scenario(
         ok = sum(1 for r in results if r.success)
         print(f"{elapsed:.1f}s, {ok}/{len(results)} OK")
         all_results.extend(results)
+    t_scenario_end = time.time()  # wall-clock for GPU correlation
 
     if metrics_task:
         metrics_task.cancel()
@@ -315,9 +443,15 @@ async def run_scenario(
     # Aggregate
     successful = [r for r in all_results if r.success]
     if not successful:
-        return {"error": "No successful requests", "total_requests": len(all_results)}
+        return {"error": "No successful requests", "total_requests": len(all_results),
+                "start_time": t_scenario_start, "end_time": t_scenario_end,
+                "metrics_samples": metrics_samples}
 
     n = len(successful)
+    ttft_stats = compute_stats([r.ttft_ms for r in successful])
+    decode_stats = compute_stats([r.decode_ms for r in successful])
+    e2e_stats = compute_stats([r.e2e_ms for r in successful])
+
     agg = {
         "scenario": scenario_name,
         "concurrency": concurrency,
@@ -325,32 +459,30 @@ async def run_scenario(
         "total_requests": len(all_results),
         "successful": n,
         "failed": len(all_results) - n,
-        "avg_ttft_ms": round(sum(r.ttft_ms for r in successful) / n, 2),
-        "avg_decode_ms": round(sum(r.decode_ms for r in successful) / n, 2),
-        "avg_e2e_ms": round(sum(r.e2e_ms for r in successful) / n, 2),
-        "min_e2e_ms": round(min(r.e2e_ms for r in successful), 2),
-        "max_e2e_ms": round(max(r.e2e_ms for r in successful), 2),
-        "p50_e2e_ms": round(sorted(r.e2e_ms for r in successful)[n // 2], 2),
-        "p95_e2e_ms": round(sorted(r.e2e_ms for r in successful)[int(n * 0.95)], 2),
-        "p99_e2e_ms": round(sorted(r.e2e_ms for r in successful)[int(n * 0.99)], 2),
+        "t_ttft_ms_mean": ttft_stats["mean"],
+        "t_ttft_ms_p50": ttft_stats["p50"],
+        "t_ttft_ms_p95": ttft_stats["p95"],
+        "t_ttft_ms_min": ttft_stats["min"],
+        "t_ttft_ms_max": ttft_stats["max"],
+        "t_decode_ms_mean": decode_stats["mean"],
+        "t_decode_ms_p50": decode_stats["p50"],
+        "t_decode_ms_p95": decode_stats["p95"],
+        "t_decode_ms_min": decode_stats["min"],
+        "t_decode_ms_max": decode_stats["max"],
+        "t_e2e_ms_mean": e2e_stats["mean"],
+        "t_e2e_ms_p50": e2e_stats["p50"],
+        "t_e2e_ms_p95": e2e_stats["p95"],
+        "t_e2e_ms_min": e2e_stats["min"],
+        "t_e2e_ms_max": e2e_stats["max"],
         "total_output_tokens": sum(r.output_tokens for r in successful),
-        "avg_output_tokens": round(sum(r.output_tokens for r in successful) / n, 1),
-        "throughput_req_per_s": round(n / (sum(r.e2e_ms for r in successful) / 1000 / n), 2)
+        "avg_output_tokens": round(sum(r.output_tokens for r in successful) / n, 10),
+        "throughput_req_per_s": round(n / (e2e_stats["mean"] / 1000 / n), 10)
             if n > 0 else 0,
+        "start_time": t_scenario_start,
+        "end_time": t_scenario_end,
+        "metrics_samples": metrics_samples,
     }
     return agg
-
-# ---------------------------------------------------------------------------
-# GPU Monitor subprocess
-# ---------------------------------------------------------------------------
-def launch_gpu_monitor(output_dir: str, interval: float = 0.5) -> Optional[asyncio.subprocess.Process]:
-    """Launch nvidia-smi monitoring in a subprocess."""
-    monitor_script = Path(__file__).resolve().parent / "07_gpu_monitor.py"
-    if not monitor_script.exists():
-        print("[06_loadgen] WARNING: GPU monitor script not found, skipping")
-        return None
-    # Will be started by the caller
-    return None
 
 # ---------------------------------------------------------------------------
 # Main
@@ -400,12 +532,13 @@ async def main():
             results[scenario_name] = agg
 
             if "error" not in agg:
-                print(f"    → avg TTFT={agg['avg_ttft_ms']:.0f}ms  "
-                      f"avg Decode={agg['avg_decode_ms']:.0f}ms  "
-                      f"avg E2E={agg['avg_e2e_ms']:.0f}ms  "
-                      f"p95={agg['p95_e2e_ms']:.0f}ms")
+                print(f"    → avg TTFT={agg['t_ttft_ms_mean']:.0f}ms  "
+                      f"avg Decode={agg['t_decode_ms_mean']:.0f}ms  "
+                      f"avg E2E={agg['t_e2e_ms_mean']:.0f}ms  "
+                      f"p95={agg['t_e2e_ms_p95']:.0f}ms")
 
     # Stop GPU monitor
+    gpu_stats_by_scenario = {}
     if gpu_monitor_proc:
         gpu_monitor_proc.terminate()
         try:
@@ -413,6 +546,35 @@ async def main():
         except asyncio.TimeoutError:
             gpu_monitor_proc.kill()
         print("[06_loadgen] GPU monitor stopped")
+
+        # Parse GPU CSV and correlate samples to scenarios
+        gpu_csv_path = out_path.parent / "06_gpu_monitor_log.csv"
+        if gpu_csv_path.exists():
+            print(f"[06_loadgen] Parsing GPU monitor data: {gpu_csv_path}")
+            gpu_samples = parse_gpu_csv(gpu_csv_path)
+            print(f"[06_loadgen]   {len(gpu_samples)} GPU samples loaded")
+
+            # Build scenario time windows from results
+            scenario_times = {}
+            for scenario_name, r in results.items():
+                t_start = r.get("start_time")
+                t_end = r.get("end_time")
+                if t_start and t_end:
+                    scenario_times[scenario_name] = (t_start, t_end)
+
+            if scenario_times and gpu_samples:
+                gpu_stats_by_scenario = correlate_gpu_to_scenarios(
+                    gpu_samples, scenario_times
+                )
+                # Embed GPU stats into each scenario result
+                for scenario_name, gpu_stats in gpu_stats_by_scenario.items():
+                    if scenario_name in results:
+                        results[scenario_name]["gpu_stats"] = gpu_stats
+                        if "overall_avg_utilization_pct" in gpu_stats:
+                            print(f"    {scenario_name}: GPU avg util = "
+                                  f"{gpu_stats['overall_avg_utilization_pct']}%")
+        else:
+            print("[06_loadgen] WARNING: GPU monitor CSV not found")
 
     # Save
     output = {
@@ -424,27 +586,39 @@ async def main():
         "output_tokens_target": args.output_tokens,
         "ramp_up_seconds": args.ramp_up_seconds,
         "scenario_results": results,
+        "gpu_monitor_enabled": args.gpu_monitor,
     }
 
     out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
     print(f"\n[06_loadgen] Results saved to {out_path}")
 
     # Summary table
+    has_gpu = any(r.get("gpu_stats") for r in results.values())
     print("\n" + "=" * 90)
     print("LOAD TEST SUMMARY")
     print("=" * 90)
-    header = (f"{'Scenario':<16s} {'Conc':>4s} {'Ctx':>6s} {'N':>4s} "
-              f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} {'tput':>8s}")
+    if has_gpu:
+        header = (f"{'Scenario':<16s} {'Conc':>4s} {'Ctx':>6s} {'N':>4s} "
+                  f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} {'tput':>8s} {'GPU%':>6s}")
+    else:
+        header = (f"{'Scenario':<16s} {'Conc':>4s} {'Ctx':>6s} {'N':>4s} "
+                  f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} {'tput':>8s}")
     print(header)
     print("-" * 90)
     for scenario_name, _, _ in runs:
         r = results.get(scenario_name, {})
         if r and "error" not in r:
+            gpu_str = ""
+            if has_gpu:
+                gs = r.get("gpu_stats", {})
+                gpu_avg = gs.get("overall_avg_utilization_pct", "-")
+                gpu_str = f"{gpu_avg:>5.0f}%" if isinstance(gpu_avg, (int, float)) else f"{str(gpu_avg):>6s}"
             print(f"{scenario_name:<16s} {r['concurrency']:>4d} "
                   f"{r['context_tokens']:>6,d} {r['successful']:>4d} "
-                  f"{r['avg_ttft_ms']:>7.0f}ms {r['avg_decode_ms']:>7.0f}ms "
-                  f"{r['avg_e2e_ms']:>7.0f}ms {r['p95_e2e_ms']:>7.0f}ms "
-                  f"{r['throughput_req_per_s']:>7.2f}/s")
+                  f"{r['t_ttft_ms_mean']:>7.0f}ms {r['t_decode_ms_mean']:>7.0f}ms "
+                  f"{r['t_e2e_ms_mean']:>7.0f}ms {r['t_e2e_ms_p95']:>7.0f}ms "
+                  f"{r['throughput_req_per_s']:>7.2f}/s"
+                  + (f" {gpu_str}" if has_gpu else ""))
     print("=" * 90)
 
 if __name__ == "__main__":

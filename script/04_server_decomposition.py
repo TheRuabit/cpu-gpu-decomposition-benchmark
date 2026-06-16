@@ -136,6 +136,23 @@ def build_payload(context_text: str, model: str, max_tokens: int) -> dict:
     }
 
 # ---------------------------------------------------------------------------
+# Statistics helper
+# ---------------------------------------------------------------------------
+def compute_stats(values: list[float], ndigits: int = 20) -> dict:
+    """Compute mean, p50, p95, min, max for a list of values."""
+    if not values:
+        return {"mean": 0, "p50": 0, "p95": 0, "min": 0, "max": 0}
+    n = len(values)
+    s = sorted(values)
+    return {
+        "mean": round(sum(values) / n, ndigits),
+        "p50": round(s[n // 2], ndigits),
+        "p95": round(s[int(n * 0.95)], ndigits),
+        "min": round(s[0], ndigits),
+        "max": round(s[-1], ndigits),
+    }
+
+# ---------------------------------------------------------------------------
 # vLLM Metrics Fetcher
 # ---------------------------------------------------------------------------
 async def fetch_vllm_metrics(session: aiohttp.ClientSession, url: str) -> dict:
@@ -181,10 +198,10 @@ def summarize_histogram_metrics(before: dict, after: dict, metric_name: str) -> 
     count_key = f"{metric_name}_count"
     result = {}
     if sum_key in before and sum_key in after:
-        result["delta_sum"] = round(after[sum_key] - before[sum_key], 4)
-        result["delta_count"] = round(after[count_key] - before[count_key], 4)
+        result["delta_sum"] = round(after[sum_key] - before[sum_key], 20)
+        result["delta_count"] = round(after[count_key] - before[count_key], 20)
         if result["delta_count"] > 0:
-            result["avg_seconds"] = round(result["delta_sum"] / result["delta_count"], 4)
+            result["avg_seconds"] = round(result["delta_sum"] / result["delta_count"], 20)
     return result
 
 # ---------------------------------------------------------------------------
@@ -399,47 +416,92 @@ async def main():
             continue
 
         n = len(traces)
-        avg_serialize = sum(t.t_serialize_ms for t in traces) / n
-        avg_first_byte = sum(t.t_first_byte_ms for t in traces) / n
-        avg_ttft = sum(t.t_ttft_ms for t in traces) / n
-        avg_decode = sum(t.t_decode_ms for t in traces) / n
-        avg_parse = sum(t.t_response_parse_ms for t in traces) / n
-        avg_e2e = sum(t.t_e2e_ms for t in traces) / n
 
-        # t_http_overhead ≈ t_first_byte (on localhost, network ~0)
-        # t_prefill ≈ TTFT - first_byte (first token after CPU overhead)
-        http_overhead = avg_first_byte
-        prefill = avg_ttft - avg_first_byte
-        if prefill < 0:
-            prefill = 0.0
+        # Compute per-metric stats from per-request values (20dp for times)
+        serialize_stats = compute_stats([t.t_serialize_ms for t in traces])
+        first_byte_stats = compute_stats([t.t_first_byte_ms for t in traces])
+        ttft_stats = compute_stats([t.t_ttft_ms for t in traces])
+        decode_stats = compute_stats([t.t_decode_ms for t in traces])
+        parse_stats = compute_stats([t.t_response_parse_ms for t in traces])
+        e2e_stats = compute_stats([t.t_e2e_ms for t in traces])
 
-        cpu_time = avg_serialize + http_overhead + avg_parse
-        gpu_time = prefill + avg_decode
-        total = cpu_time + gpu_time
-        cpu_pct = (cpu_time / total * 100) if total > 0 else 0
-        gpu_pct = (gpu_time / total * 100) if total > 0 else 0
+        # Derived: t_http_overhead ≈ t_first_byte (on localhost, network ~0)
+        http_oh_stats = compute_stats([t.t_first_byte_ms for t in traces])
+        # Derived: t_prefill ≈ TTFT - first_byte (first token after CPU overhead)
+        prefill_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) for t in traces]
+        prefill_stats = compute_stats(prefill_vals)
+        # Derived: total = cpu_time + gpu_time
+        cpu_vals = [t.t_serialize_ms + t.t_first_byte_ms for t in traces]
+        cpu_stats = compute_stats(cpu_vals)
+        gpu_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) + t.t_decode_ms for t in traces]
+        gpu_stats = compute_stats(gpu_vals)
+        total_vals = [c + g for c, g in zip(cpu_vals, gpu_vals)]
+        total_stats = compute_stats(total_vals)
+
+        # Percentages from mean values (10dp)
+        cpu_pct = round((cpu_stats["mean"] / total_stats["mean"] * 100) if total_stats["mean"] > 0 else 0, 10)
+        gpu_pct = round((gpu_stats["mean"] / total_stats["mean"] * 100) if total_stats["mean"] > 0 else 0, 10)
 
         decomposition[scenario_name] = {
             "concurrency": concurrency,
             "context": ctx_len,
             "num_requests": n,
-            # Raw components (ms)
-            "t_serialize_ms": round(avg_serialize, 4),
-            "t_http_overhead_ms": round(http_overhead, 2),
-            "t_prefill_ms": round(prefill, 2),
-            "t_decode_ms": round(avg_decode, 2),
-            "t_response_parse_ms": round(avg_parse, 4),
-            "t_total_ms": round(total, 2),
-            # Ratios
-            "cpu_time_ms": round(cpu_time, 2),
-            "gpu_time_ms": round(gpu_time, 2),
-            "cpu_percent": round(cpu_pct, 2),
-            "gpu_percent": round(gpu_pct, 2),
+            # Serialize
+            "t_serialize_ms_mean": serialize_stats["mean"],
+            "t_serialize_ms_p50": serialize_stats["p50"],
+            "t_serialize_ms_p95": serialize_stats["p95"],
+            "t_serialize_ms_min": serialize_stats["min"],
+            "t_serialize_ms_max": serialize_stats["max"],
+            # HTTP overhead
+            "t_http_overhead_ms_mean": http_oh_stats["mean"],
+            "t_http_overhead_ms_p50": http_oh_stats["p50"],
+            "t_http_overhead_ms_p95": http_oh_stats["p95"],
+            "t_http_overhead_ms_min": http_oh_stats["min"],
+            "t_http_overhead_ms_max": http_oh_stats["max"],
+            # Prefill
+            "t_prefill_ms_mean": prefill_stats["mean"],
+            "t_prefill_ms_p50": prefill_stats["p50"],
+            "t_prefill_ms_p95": prefill_stats["p95"],
+            "t_prefill_ms_min": prefill_stats["min"],
+            "t_prefill_ms_max": prefill_stats["max"],
+            # Decode
+            "t_decode_ms_mean": decode_stats["mean"],
+            "t_decode_ms_p50": decode_stats["p50"],
+            "t_decode_ms_p95": decode_stats["p95"],
+            "t_decode_ms_min": decode_stats["min"],
+            "t_decode_ms_max": decode_stats["max"],
+            # Response parse
+            "t_response_parse_ms_mean": parse_stats["mean"],
+            "t_response_parse_ms_p50": parse_stats["p50"],
+            "t_response_parse_ms_p95": parse_stats["p95"],
+            "t_response_parse_ms_min": parse_stats["min"],
+            "t_response_parse_ms_max": parse_stats["max"],
+            # Total
+            "t_total_ms_mean": total_stats["mean"],
+            "t_total_ms_p50": total_stats["p50"],
+            "t_total_ms_p95": total_stats["p95"],
+            "t_total_ms_min": total_stats["min"],
+            "t_total_ms_max": total_stats["max"],
+            # CPU time
+            "cpu_time_ms_mean": cpu_stats["mean"],
+            "cpu_time_ms_p50": cpu_stats["p50"],
+            "cpu_time_ms_p95": cpu_stats["p95"],
+            "cpu_time_ms_min": cpu_stats["min"],
+            "cpu_time_ms_max": cpu_stats["max"],
+            # GPU time
+            "gpu_time_ms_mean": gpu_stats["mean"],
+            "gpu_time_ms_p50": gpu_stats["p50"],
+            "gpu_time_ms_p95": gpu_stats["p95"],
+            "gpu_time_ms_min": gpu_stats["min"],
+            "gpu_time_ms_max": gpu_stats["max"],
+            # Percentages (single values at 10dp)
+            "cpu_percent": cpu_pct,
+            "gpu_percent": gpu_pct,
         }
 
         print(f"\n  {scenario_name}: CPU={cpu_pct:.1f}% GPU={gpu_pct:.1f}%  "
-              f"(HTTP OH={http_overhead:.0f}ms, Prefill={prefill:.0f}ms, "
-              f"Decode={avg_decode:.0f}ms)")
+              f"(HTTP OH={http_oh_stats['mean']:.0f}ms, Prefill={prefill_stats['mean']:.0f}ms, "
+              f"Decode={decode_stats['mean']:.0f}ms)")
 
     # -------------------------------------------------------------------
     # Save
@@ -448,12 +510,12 @@ async def main():
     for t in all_traces:
         raw_traces.append({
             "scenario": t.scenario, "batch": t.batch, "idx": t.idx, "ctx": t.ctx,
-            "t_serialize_ms": round(t.t_serialize_ms, 4),
-            "t_first_byte_ms": round(t.t_first_byte_ms, 2),
-            "t_ttft_ms": round(t.t_ttft_ms, 2),
-            "t_decode_ms": round(t.t_decode_ms, 2),
-            "t_response_parse_ms": round(t.t_response_parse_ms, 4),
-            "t_e2e_ms": round(t.t_e2e_ms, 2),
+            "t_serialize_ms": round(t.t_serialize_ms, 20),
+            "t_first_byte_ms": round(t.t_first_byte_ms, 20),
+            "t_ttft_ms": round(t.t_ttft_ms, 20),
+            "t_decode_ms": round(t.t_decode_ms, 20),
+            "t_response_parse_ms": round(t.t_response_parse_ms, 20),
+            "t_e2e_ms": round(t.t_e2e_ms, 20),
             "num_output_tokens": t.num_output_tokens,
             "success": t.success,
             "error": t.error,
@@ -490,10 +552,10 @@ async def main():
         if d and "error" not in d:
             print(f"{scenario_name:<16s} {d.get('concurrency', 0):>4d} "
                   f"{d.get('context', 0):>6,d} "
-                  f"{d['t_http_overhead_ms']:>8.0f}ms "
-                  f"{d['t_prefill_ms']:>8.0f}ms "
-                  f"{d['t_decode_ms']:>8.0f}ms "
-                  f"{d['t_total_ms']:>8.0f}ms "
+                  f"{d['t_http_overhead_ms_mean']:>8.0f}ms "
+                  f"{d['t_prefill_ms_mean']:>8.0f}ms "
+                  f"{d['t_decode_ms_mean']:>8.0f}ms "
+                  f"{d['t_total_ms_mean']:>8.0f}ms "
                   f"{d['cpu_percent']:>6.1f}% "
                   f"{d['gpu_percent']:>6.1f}%")
     print("=" * 95)

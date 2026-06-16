@@ -91,6 +91,23 @@ else:
     SCENARIOS = ALL_SCENARIOS
 
 # ---------------------------------------------------------------------------
+# Statistics helper
+# ---------------------------------------------------------------------------
+def compute_stats(values: list[float], ndigits: int = 20) -> dict:
+    """Compute mean, p50, p95, min, max for a list of values."""
+    if not values:
+        return {"mean": 0, "p50": 0, "p95": 0, "min": 0, "max": 0}
+    n = len(values)
+    s = sorted(values)
+    return {
+        "mean": round(sum(values) / n, ndigits),
+        "p50": round(s[n // 2], ndigits),
+        "p95": round(s[int(n * 0.95)], ndigits),
+        "min": round(s[0], ndigits),
+        "max": round(s[-1], ndigits),
+    }
+
+# ---------------------------------------------------------------------------
 # Reuse the same trace/profiling infrastructure from script 04
 # ---------------------------------------------------------------------------
 # (Duplicated to keep scripts self-contained; in production these would be
@@ -286,34 +303,75 @@ async def main():
             continue
 
         n = len(traces)
-        avg_serialize = sum(t.t_serialize_ms for t in traces) / n
-        avg_first_byte = sum(t.t_first_byte_ms for t in traces) / n
-        avg_ttft = sum(t.t_ttft_ms for t in traces) / n
-        avg_decode = sum(t.t_decode_ms for t in traces) / n
-        avg_parse = sum(t.t_response_parse_ms for t in traces) / n
 
-        http_overhead = avg_first_byte
-        prefill = max(0, avg_ttft - avg_first_byte)
-        cpu_time = avg_serialize + http_overhead + avg_parse
-        gpu_time = prefill + avg_decode
-        total = cpu_time + gpu_time
-        cpu_pct = (cpu_time / total * 100) if total > 0 else 0
-        gpu_pct = (gpu_time / total * 100) if total > 0 else 0
+        serialize_stats = compute_stats([t.t_serialize_ms for t in traces])
+        first_byte_stats = compute_stats([t.t_first_byte_ms for t in traces])
+        ttft_stats = compute_stats([t.t_ttft_ms for t in traces])
+        decode_stats = compute_stats([t.t_decode_ms for t in traces])
+        parse_stats = compute_stats([t.t_response_parse_ms for t in traces])
+
+        # Derived: http_overhead ≈ first_byte (localhost)
+        http_oh_stats = compute_stats([t.t_first_byte_ms for t in traces])
+        # Derived: prefill ≈ ttft - first_byte
+        prefill_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) for t in traces]
+        prefill_stats = compute_stats(prefill_vals)
+        # Derived: total, cpu_time, gpu_time
+        cpu_vals = [t.t_serialize_ms + t.t_first_byte_ms for t in traces]
+        cpu_stats = compute_stats(cpu_vals)
+        gpu_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) + t.t_decode_ms for t in traces]
+        gpu_stats = compute_stats(gpu_vals)
+        total_vals = [c + g for c, g in zip(cpu_vals, gpu_vals)]
+        total_stats = compute_stats(total_vals)
+
+        cpu_pct = round((cpu_stats["mean"] / total_stats["mean"] * 100) if total_stats["mean"] > 0 else 0, 10)
+        gpu_pct = round((gpu_stats["mean"] / total_stats["mean"] * 100) if total_stats["mean"] > 0 else 0, 10)
 
         decomposition[scenario_name] = {
             "concurrency": concurrency,
             "context": ctx_len,
             "num_requests": n,
-            "t_serialize_ms": round(avg_serialize, 4),
-            "t_http_overhead_ms": round(http_overhead, 2),
-            "t_prefill_ms": round(prefill, 2),
-            "t_decode_ms": round(avg_decode, 2),
-            "t_response_parse_ms": round(avg_parse, 4),
-            "t_total_ms": round(total, 2),
-            "cpu_time_ms": round(cpu_time, 2),
-            "gpu_time_ms": round(gpu_time, 2),
-            "cpu_percent": round(cpu_pct, 2),
-            "gpu_percent": round(gpu_pct, 2),
+            "t_serialize_ms_mean": serialize_stats["mean"],
+            "t_serialize_ms_p50": serialize_stats["p50"],
+            "t_serialize_ms_p95": serialize_stats["p95"],
+            "t_serialize_ms_min": serialize_stats["min"],
+            "t_serialize_ms_max": serialize_stats["max"],
+            "t_http_overhead_ms_mean": http_oh_stats["mean"],
+            "t_http_overhead_ms_p50": http_oh_stats["p50"],
+            "t_http_overhead_ms_p95": http_oh_stats["p95"],
+            "t_http_overhead_ms_min": http_oh_stats["min"],
+            "t_http_overhead_ms_max": http_oh_stats["max"],
+            "t_prefill_ms_mean": prefill_stats["mean"],
+            "t_prefill_ms_p50": prefill_stats["p50"],
+            "t_prefill_ms_p95": prefill_stats["p95"],
+            "t_prefill_ms_min": prefill_stats["min"],
+            "t_prefill_ms_max": prefill_stats["max"],
+            "t_decode_ms_mean": decode_stats["mean"],
+            "t_decode_ms_p50": decode_stats["p50"],
+            "t_decode_ms_p95": decode_stats["p95"],
+            "t_decode_ms_min": decode_stats["min"],
+            "t_decode_ms_max": decode_stats["max"],
+            "t_response_parse_ms_mean": parse_stats["mean"],
+            "t_response_parse_ms_p50": parse_stats["p50"],
+            "t_response_parse_ms_p95": parse_stats["p95"],
+            "t_response_parse_ms_min": parse_stats["min"],
+            "t_response_parse_ms_max": parse_stats["max"],
+            "t_total_ms_mean": total_stats["mean"],
+            "t_total_ms_p50": total_stats["p50"],
+            "t_total_ms_p95": total_stats["p95"],
+            "t_total_ms_min": total_stats["min"],
+            "t_total_ms_max": total_stats["max"],
+            "cpu_time_ms_mean": cpu_stats["mean"],
+            "cpu_time_ms_p50": cpu_stats["p50"],
+            "cpu_time_ms_p95": cpu_stats["p95"],
+            "cpu_time_ms_min": cpu_stats["min"],
+            "cpu_time_ms_max": cpu_stats["max"],
+            "gpu_time_ms_mean": gpu_stats["mean"],
+            "gpu_time_ms_p50": gpu_stats["p50"],
+            "gpu_time_ms_p95": gpu_stats["p95"],
+            "gpu_time_ms_min": gpu_stats["min"],
+            "gpu_time_ms_max": gpu_stats["max"],
+            "cpu_percent": cpu_pct,
+            "gpu_percent": gpu_pct,
         }
 
     # -------------------------------------------------------------------
@@ -330,14 +388,14 @@ async def main():
             lmc = decomposition.get(scenario_name, {})
             if "error" not in hbm and "error" not in lmc:
                 delta_cpu = lmc["cpu_percent"] - hbm["cpu_percent"]
-                delta_http = lmc["t_http_overhead_ms"] - hbm["t_http_overhead_ms"]
+                delta_http = lmc["t_http_overhead_ms_mean"] - hbm["t_http_overhead_ms_mean"]
                 comparison[scenario_name] = {
                     "hbm_cpu_pct": hbm["cpu_percent"],
                     "lmcache_cpu_pct": lmc["cpu_percent"],
-                    "delta_cpu_pct": round(delta_cpu, 2),
-                    "hbm_http_overhead_ms": hbm["t_http_overhead_ms"],
-                    "lmcache_http_overhead_ms": lmc["t_http_overhead_ms"],
-                    "delta_http_overhead_ms": round(delta_http, 2),
+                    "delta_cpu_pct": round(delta_cpu, 10),
+                    "hbm_http_overhead_ms": hbm["t_http_overhead_ms_mean"],
+                    "lmcache_http_overhead_ms": lmc["t_http_overhead_ms_mean"],
+                    "delta_http_overhead_ms": round(delta_http, 20),
                 }
     else:
         print(f"[05_lmcache] No HBM baseline found at {hbm_path} — skipping comparison")
@@ -349,12 +407,12 @@ async def main():
     for t in all_traces:
         raw_traces.append({
             "scenario": t.scenario, "batch": t.batch, "idx": t.idx, "ctx": t.ctx,
-            "t_serialize_ms": round(t.t_serialize_ms, 4),
-            "t_first_byte_ms": round(t.t_first_byte_ms, 2),
-            "t_ttft_ms": round(t.t_ttft_ms, 2),
-            "t_decode_ms": round(t.t_decode_ms, 2),
-            "t_response_parse_ms": round(t.t_response_parse_ms, 4),
-            "t_e2e_ms": round(t.t_e2e_ms, 2),
+            "t_serialize_ms": round(t.t_serialize_ms, 20),
+            "t_first_byte_ms": round(t.t_first_byte_ms, 20),
+            "t_ttft_ms": round(t.t_ttft_ms, 20),
+            "t_decode_ms": round(t.t_decode_ms, 20),
+            "t_response_parse_ms": round(t.t_response_parse_ms, 20),
+            "t_e2e_ms": round(t.t_e2e_ms, 20),
             "num_output_tokens": t.num_output_tokens,
             "success": t.success,
             "error": t.error,
@@ -392,10 +450,10 @@ async def main():
         if d and "error" not in d:
             print(f"{scenario_name:<16s} {d.get('concurrency', 0):>4d} "
                   f"{d.get('context', 0):>6,d} "
-                  f"{d['t_http_overhead_ms']:>8.0f}ms "
-                  f"{d['t_prefill_ms']:>8.0f}ms "
-                  f"{d['t_decode_ms']:>8.0f}ms "
-                  f"{d['t_total_ms']:>8.0f}ms "
+                  f"{d['t_http_overhead_ms_mean']:>8.0f}ms "
+                  f"{d['t_prefill_ms_mean']:>8.0f}ms "
+                  f"{d['t_decode_ms_mean']:>8.0f}ms "
+                  f"{d['t_total_ms_mean']:>8.0f}ms "
                   f"{d['cpu_percent']:>6.1f}% "
                   f"{d['gpu_percent']:>6.1f}%")
     print("=" * 95)
