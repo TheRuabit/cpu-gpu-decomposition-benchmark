@@ -93,7 +93,7 @@ ALL_SCENARIOS = [
     ("conc4_8k",     4,  8000),
     ("conc16_32k",  16,  32000),
     ("conc32_32k",  32,  32000),
-    ("conc32_100k", 32,  100000),
+    ("conc32_50k", 32,  50000),
 ]
 
 if args.scenarios:
