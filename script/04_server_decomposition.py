@@ -243,6 +243,7 @@ async def trace_one_request(
 
     async with semaphore:
         try:
+            t_first_byte = None
             t_post = time.perf_counter()
             async with session.post(
                 f"{url}/v1/chat/completions",
@@ -256,10 +257,11 @@ async def trace_one_request(
                     t.error = f"HTTP {resp.status}: {err[:300]}"
                     t.t_e2e_ms = (time.perf_counter() - e2e_start) * 1000
                     return t
+                    
 
                 first_byte = False
                 first_token = False
-                t_first_byte = None
+                # t_first_byte = None
                 t_first_token = None
                 t_last_token = None
                 parse_start = None
