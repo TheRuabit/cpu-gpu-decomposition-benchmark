@@ -50,8 +50,8 @@ parser.add_argument("--model", default="models/Qwen3-30B-A3B",
 parser.add_argument("--output", default=None,
                     help="Output JSON path")
 parser.add_argument("--hbm-results", default=None,
-                    help="Path to HBM prefix cache results (for comparison)")
-parser.add_argument("--output-tokens", type=int, default=512)
+                    help="Path to HBM prefix cache results(for comparison)")
+parser.add_argument("--output-tokens", type=int, default=64)
 parser.add_argument("--num-batches", type=int, default=3)
 parser.add_argument("--warmup-batches", type=int, default=1)
 parser.add_argument("--scenarios", nargs="+", default=None)
@@ -78,7 +78,7 @@ ALL_SCENARIOS = [
     ("single_1k",    1,  1000),
     ("single_8k",    1,  8000),
     ("single_32k",   1,  32000),
-    ("single_100k",  1,  100000),
+    ("single_50k",  1,  50000),
     ("conc4_8k",     4,  8000),
     ("conc16_32k",  16,  32000),
     ("conc32_32k",  32,  32000),
@@ -187,6 +187,9 @@ async def trace_one_request(
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=600),
             ) as resp:
+                
+                t_first_byte = time.perf_counter()
+                t.t_first_byte_ms = (t_first_byte - t_post) * 1000
                 if resp.status != 200:
                     err = await resp.text()
                     t.success = False
@@ -204,8 +207,7 @@ async def trace_one_request(
 
                 async for line in resp.content:
                     if not first_byte:
-                        t_first_byte = time.perf_counter()
-                        t.t_first_byte_ms = (t_first_byte - t_post) * 1000
+
                         first_byte = True
                         parse_start = time.perf_counter()
 

@@ -2,25 +2,36 @@
 """
 Concurrent Load Generator
 ==========================
-Drives concurrent agentic LLM requests against a vLLM server using asyncio.
-Supports the full benchmark matrix: concurrency 1–32, context 1k–100k tokens.
+Drives sustained concurrent LLM requests against a vLLM server using asyncio.
+Matches the reference methodology: time-based continuous dispatch, max_tokens=64,
+shared system prompt for prefix caching, json=payload for request sending.
 
-Features:
-  - Configurable warmup + measurement phases
-  - Real-time progress reporting
-  - Per-request and aggregate timing collection
-  - Prometheus metrics capture (vLLM /metrics endpoint)
-  - Throttled ramp-up to avoid overwhelming the scheduler instantly
+Primary mode (matching Reference/script/05_load_generator.py):
+  Time-based continuous dispatch — fires `concurrency` requests in a tight loop
+  for a fixed `duration` in seconds. This captures steady-state scheduling behavior.
+
+Batch mode (original reproduction, for controlled measurements):
+  Fixed number of batches — fires `concurrency` requests per batch, `num_batches` times.
+
+Features retained from original reproduction:
+  - Prometheus metrics sampling during run
+  - Optional GPU monitor subprocess (nvidia-smi)
+  - GPU utilization correlation per scenario via timestamps
+  - Configurable warmup + ramp-up
 
 Usage:
-    # Single scenario
+    # Time-based: single scenario (matching reference)
     python script/06_load_generator.py --url http://localhost:8000 \
-        --concurrency 4 --context 8000 --duration 60
+        --concurrency 4 --context 8000 --duration 30
 
-    # Full matrix
+    # Time-based: full matrix (matching reference scenarios + durations)
     python script/06_load_generator.py --url http://localhost:8000 --matrix
 
-    # With GPU monitoring (runs nvidia-smi in background)
+    # Batch-based: controlled measurements
+    python script/06_load_generator.py --url http://localhost:8000 \
+        --concurrency 4 --context 8000 --num-batches 5
+
+    # With GPU monitoring
     python script/06_load_generator.py --url http://localhost:8000 --matrix --gpu-monitor
 
 Output:
@@ -32,7 +43,6 @@ import asyncio
 import csv
 import json
 import os
-import signal
 import sys
 import time
 from collections import defaultdict
@@ -49,22 +59,23 @@ parser.add_argument("--url", default="http://localhost:8000",
 parser.add_argument("--model", default="models/Qwen3-30B-A3B",
                     help="Model name for API")
 parser.add_argument("--concurrency", type=int, default=4,
-                    help="Number of concurrent requests")
+                    help="Number of concurrent requests per iteration")
 parser.add_argument("--context", type=int, default=8000,
                     help="Target context length in tokens")
-parser.add_argument("--output-tokens", type=int, default=512,
-                    help="Max output tokens per request")
+parser.add_argument("--output-tokens", type=int, default=64,
+                    help="Max output tokens per request (reference: 64)")
 parser.add_argument("--duration", type=float, default=0,
-                    help="Run duration in seconds (0 = run fixed number of batches)")
+                    help="Run duration in seconds (0 = use --num-batches for batch mode)")
 parser.add_argument("--num-batches", type=int, default=3,
-                    help="Number of batches (when duration=0)")
-parser.add_argument("--warmup-batches", type=int, default=1)
+                    help="Number of batches (only used when --duration 0)")
+parser.add_argument("--warmup-batches", type=int, default=1,
+                    help="Warmup iterations before measurement")
 parser.add_argument("--ramp-up-seconds", type=float, default=2.0,
                     help="Gradually ramp up concurrency over this many seconds")
 parser.add_argument("--output", default=None,
                     help="Output JSON path")
 parser.add_argument("--matrix", action="store_true",
-                    help="Run full test matrix")
+                    help="Run full time-based test matrix (matching reference scenarios)")
 parser.add_argument("--gpu-monitor", action="store_true",
                     help="Launch GPU monitor subprocess during benchmark")
 parser.add_argument("--metrics-interval", type=float, default=2.0,
@@ -80,52 +91,51 @@ out_path.parent.mkdir(parents=True, exist_ok=True)
 import aiohttp
 
 # ---------------------------------------------------------------------------
-# Test matrix
+# Test matrix — matching reference Reference/script/05_load_generator.py
 # ---------------------------------------------------------------------------
-MATRIX = [
-    ("single_1k",    1,  1000),
-    ("single_8k",    1,  8000),
-    ("single_32k",   1,  32000),
-    ("single_50k",  1,  50000),
-    ("conc4_8k",     4,  8000),
-    ("conc16_32k",  16,  32000),
-    ("conc32_32k",  32,  32000),
-    ("conc32_50k", 32,  50000),
+REFERENCE_MATRIX = [
+    # (label, concurrency, context_tokens, duration_seconds)
+    ("conc1_ctx1000",      1,   1000,   20),
+    ("conc4_ctx8000",      4,   8000,   30),
+    ("conc16_ctx32000",   16,  32000,   40),
+    ("conc32_ctx32000",   32,  32000,   40),
+    ("conc32_ctx50000",   32,  50000,   40),
 ]
 
 # ---------------------------------------------------------------------------
-# Context generator
+# Context generator — matching reference style
+#   Reference uses:
+#     text = "Analyze this code for performance issues. " * (ctx_size // 6 + 1)
+#     system = "You are helpful. " * 200
+#     user_content = text[:ctx_size * 4]
 # ---------------------------------------------------------------------------
-_CONTEXT_CACHE = {}
+_CONTEXT_CACHE: dict[int, str] = {}
 
 def get_context_text(target_tokens: int) -> str:
+    """Generate context text of approximately `target_tokens` tokens.
+
+    Matches the reference's approach: a repeated phrase sliced to a character
+    estimate (4 chars/token), with a long shared system prompt that benefits
+    from prefix caching.
+    """
     if target_tokens in _CONTEXT_CACHE:
         return _CONTEXT_CACHE[target_tokens]
-    seed = (
-        "System: You are an AI coding assistant with tools for reading files, "
-        "searching code, and executing shell commands. Be thorough and precise.\n\n"
-        "User: Please analyze this codebase for performance issues and suggest "
-        "optimizations. Consider CPU, memory, and IO bottlenecks.\n\n"
-        + ("def process_pipeline(data):\n"
-           "    cleaned = clean(data)\n"
-           "    transformed = transform(cleaned)\n"
-           "    validated = validate(transformed)\n"
-           "    return validated\n\n" * 200)
-        + "Assistant: I'll analyze the pipeline step by step. " * 200
-    )
-    chars_needed = target_tokens * 4
-    if chars_needed <= len(seed):
-        text = seed[:chars_needed]
-    else:
-        text = (seed * ((chars_needed // len(seed)) + 1))[:chars_needed]
-    _CONTEXT_CACHE[target_tokens] = text
-    return text
+
+    text = "Analyze this code for performance issues. " * (target_tokens // 6 + 1)
+    user_content = text[:target_tokens * 4]
+    _CONTEXT_CACHE[target_tokens] = user_content
+    return user_content
+
 
 def build_payload(ctx_text: str, model: str, max_tokens: int) -> dict:
+    """Build an OpenAI-compatible chat request payload.
+
+    Uses a long shared system prompt to enable prefix caching (matching reference).
+    """
     return {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "You are helpful. " * 200},
             {"role": "user", "content": ctx_text},
         ],
         "max_tokens": max_tokens,
@@ -228,7 +238,6 @@ def correlate_gpu_to_scenarios(
     """
     result = {}
     for scenario_name, (t_start, t_end) in scenario_times.items():
-        # Collect samples that fall within this scenario's time window
         window_samples = [
             s for s in gpu_samples
             if t_start <= s["unix_timestamp"] <= t_end
@@ -237,7 +246,6 @@ def correlate_gpu_to_scenarios(
             result[scenario_name] = {"error": "No GPU samples in window"}
             continue
 
-        # Group by GPU index
         by_gpu = defaultdict(list)
         for s in window_samples:
             by_gpu[s["gpu_index"]].append(s)
@@ -293,18 +301,21 @@ def compute_stats(values: list[float], ndigits: int = 20) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Worker
+# Request result
 # ---------------------------------------------------------------------------
 @dataclass
 class ReqResult:
     idx: int = 0
-    ttft_ms: float = 0.0
-    decode_ms: float = 0.0
-    e2e_ms: float = 0.0
+    ttft_ms: float = 0.0       # time from HTTP POST to first token
+    decode_ms: float = 0.0     # time from first token to last token
+    e2e_ms: float = 0.0        # total wall clock (from POST to stream end)
     output_tokens: int = 0
     success: bool = True
     error: str = ""
 
+# ---------------------------------------------------------------------------
+# Single request worker — matching reference send_request pattern
+# ---------------------------------------------------------------------------
 async def worker(
     session: aiohttp.ClientSession,
     url: str,
@@ -312,18 +323,21 @@ async def worker(
     idx: int,
     semaphore: asyncio.Semaphore,
 ) -> ReqResult:
-    """Send one streaming request and return timing."""
+    """Send one streaming request and collect timing.
+
+    Uses session.post(..., json=payload) matching the reference approach.
+    Reference measures TTFT from perf_counter at function entry (t_start),
+    we additionally measure decode time and count output tokens.
+    """
     r = ReqResult(idx=idx)
-    body = json.dumps(payload, ensure_ascii=False)
     t_start = time.perf_counter()
 
     async with semaphore:
         try:
             t_post = time.perf_counter()
             async with session.post(
-                f"{url}/v1/chat/completions",
-                data=body,
-                headers={"Content-Type": "application/json"},
+                url,
+                json=payload,                              # matching reference: json=payload
                 timeout=aiohttp.ClientTimeout(total=600),
             ) as resp:
                 if resp.status != 200:
@@ -343,8 +357,9 @@ async def worker(
                             chunk = json.loads(line_str[6:])
                             choices = chunk.get("choices", [])
                             if choices:
-                                content = choices[0].get("delta", {}).get("content", "")
-                                if content:
+                                delta = choices[0].get("delta", {})
+                                # Match reference: check both content and reasoning
+                                if delta.get("content") or delta.get("reasoning"):
                                     if not first_token:
                                         t_first_token = time.perf_counter()
                                         r.ttft_ms = (t_first_token - t_post) * 1000
@@ -368,9 +383,172 @@ async def worker(
     return r
 
 # ---------------------------------------------------------------------------
-# Scenario runner
+# Time-based scenario runner (matching reference run_phase)
 # ---------------------------------------------------------------------------
-async def run_scenario(
+async def run_scenario_time_based(
+    session: aiohttp.ClientSession,
+    url: str,
+    model: str,
+    scenario_name: str,
+    concurrency: int,
+    ctx_len: int,
+    output_tokens: int,
+    duration_s: float,
+    warmup_batches: int,
+    ramp_up_s: float,
+    metrics_interval: float,
+    collect_metrics: bool,
+) -> dict:
+    """Run a scenario with time-based continuous dispatch.
+
+    Fires `concurrency` requests in a tight loop for `duration_s` seconds,
+    exactly matching the reference run_phase() pattern.
+
+    Returns aggregated results with reference-compatible metrics.
+    """
+    ctx_text = get_context_text(ctx_len)
+    payload = build_payload(ctx_text, model, output_tokens)
+    sem = asyncio.Semaphore(concurrency * 2)  # matching reference: concurrency * 2
+    connector = aiohttp.TCPConnector(limit=concurrency * 2)
+
+    print(f"  Running conc={concurrency}, ctx={ctx_len} for {duration_s}s...")
+
+    # Create a fresh session with the connector for this scenario
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as scenario_session:
+        # Warmup
+        if warmup_batches > 0:
+            warmup_tasks = []
+            for w in range(warmup_batches):
+                for i in range(concurrency):
+                    warmup_tasks.append(worker(scenario_session, url, payload, i, sem))
+            await asyncio.gather(*warmup_tasks)
+            warmup_tasks.clear()
+
+        # Metrics sampling task
+        metrics_samples = []
+        metrics_task = None
+
+        async def metrics_loop():
+            while True:
+                m = await sample_metrics(session, url)
+                if m:
+                    metrics_samples.append({
+                        "timestamp": time.time(),
+                        "metrics": m,
+                    })
+                await asyncio.sleep(metrics_interval)
+
+        if collect_metrics:
+            metrics_task = asyncio.create_task(metrics_loop())
+
+        # ---- Time-based continuous dispatch (matching reference) ----
+        results = []
+        ramp_delay = ramp_up_s / concurrency if concurrency > 1 and ramp_up_s > 0 else 0
+
+        t_scenario_start = time.time()  # wall-clock for GPU correlation
+        loop_start = time.perf_counter()
+
+        while time.perf_counter() - loop_start < duration_s:
+            tasks = []
+            for i in range(concurrency):
+                if ramp_delay > 0:
+                    await asyncio.sleep(ramp_delay)
+                tasks.append(worker(scenario_session, url, payload, i, sem))
+
+            batch = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in batch:
+                if isinstance(r, ReqResult):
+                    results.append(r)
+                elif isinstance(r, Exception):
+                    results.append(ReqResult(success=False, error=str(r)))
+                else:
+                    results.append(r)
+
+        t_scenario_end = time.time()  # wall-clock for GPU correlation
+
+        if metrics_task:
+            metrics_task.cancel()
+            try:
+                await metrics_task
+            except asyncio.CancelledError:
+                pass
+
+    # ---- Aggregate ----
+    all_completed = [r for r in results if isinstance(r, ReqResult)]
+    successful = [r for r in all_completed if r.success]
+    total_requests = len(all_completed)
+    failed = total_requests - len(successful)
+
+    if not successful:
+        return {
+            "scenario": scenario_name,
+            "concurrency": concurrency,
+            "context_tokens": ctx_len,
+            "duration_s": duration_s,
+            "total_requests": total_requests,
+            "successful": 0,
+            "failed": failed,
+            "error": "No successful requests",
+            "start_time": t_scenario_start,
+            "end_time": t_scenario_end,
+            "metrics_samples": metrics_samples,
+        }
+
+    # Per-request timing metrics
+    n = len(successful)
+    ttft_stats = compute_stats([r.ttft_ms for r in successful])
+    decode_stats = compute_stats([r.decode_ms for r in successful])
+    e2e_stats = compute_stats([r.e2e_ms for r in successful])
+
+    # Reference-compatible metrics (time_s = e2e in seconds, ttft_s = ttft in seconds)
+    times_s = [r.e2e_ms / 1000 for r in successful]
+    ttfts_s = [r.ttft_ms / 1000 for r in successful]
+
+    agg = {
+        "scenario": scenario_name,
+        "concurrency": concurrency,
+        "context_tokens": ctx_len,
+        "duration_s": duration_s,
+        "total_requests": total_requests,
+        "successful": n,
+        "failed": failed,
+        # Reference-compatible metrics
+        "count": n,
+        "mean_time_s": round(sum(times_s) / n, 20),
+        "p50_time_s": round(sorted(times_s)[n // 2], 20),
+        "mean_ttft_s": round(sum(ttfts_s) / n, 20),
+        "total_tokens": sum(r.output_tokens for r in successful),
+        "throughput_req_per_s": round(n / duration_s, 10),
+        # Detailed reproduction metrics
+        "t_ttft_ms_mean": ttft_stats["mean"],
+        "t_ttft_ms_p50": ttft_stats["p50"],
+        "t_ttft_ms_p95": ttft_stats["p95"],
+        "t_ttft_ms_min": ttft_stats["min"],
+        "t_ttft_ms_max": ttft_stats["max"],
+        "t_decode_ms_mean": decode_stats["mean"],
+        "t_decode_ms_p50": decode_stats["p50"],
+        "t_decode_ms_p95": decode_stats["p95"],
+        "t_decode_ms_min": decode_stats["min"],
+        "t_decode_ms_max": decode_stats["max"],
+        "t_e2e_ms_mean": e2e_stats["mean"],
+        "t_e2e_ms_p50": e2e_stats["p50"],
+        "t_e2e_ms_p95": e2e_stats["p95"],
+        "t_e2e_ms_min": e2e_stats["min"],
+        "t_e2e_ms_max": e2e_stats["max"],
+        "total_output_tokens": sum(r.output_tokens for r in successful),
+        "avg_output_tokens": round(sum(r.output_tokens for r in successful) / n, 10),
+        "start_time": t_scenario_start,
+        "end_time": t_scenario_end,
+        "metrics_samples": metrics_samples,
+    }
+    return agg
+
+
+# ---------------------------------------------------------------------------
+# Batch-based scenario runner (original reproduction, retained for compatibility)
+# ---------------------------------------------------------------------------
+async def run_scenario_batch(
     session: aiohttp.ClientSession,
     url: str,
     model: str,
@@ -384,7 +562,11 @@ async def run_scenario(
     metrics_interval: float,
     collect_metrics: bool,
 ) -> dict:
-    """Run warmup + measurement batches for one scenario."""
+    """Run warmup + measurement batches for one scenario.
+
+    Original reproduction pattern — fires `concurrency` requests per batch,
+    `num_batches` times. Better for controlled, repeatable measurements.
+    """
     ctx_text = get_context_text(ctx_len)
     payload = build_payload(ctx_text, model, output_tokens)
     sem = asyncio.Semaphore(concurrency)
@@ -415,7 +597,7 @@ async def run_scenario(
     all_results = []
     ramp_delay = ramp_up_s / concurrency if concurrency > 1 and ramp_up_s > 0 else 0
 
-    t_scenario_start = time.time()  # wall-clock for GPU correlation
+    t_scenario_start = time.time()
     for b in range(num_batches):
         batch_tasks = []
         for i in range(concurrency):
@@ -431,7 +613,7 @@ async def run_scenario(
         ok = sum(1 for r in results if r.success)
         print(f"{elapsed:.1f}s, {ok}/{len(results)} OK")
         all_results.extend(results)
-    t_scenario_end = time.time()  # wall-clock for GPU correlation
+    t_scenario_end = time.time()
 
     if metrics_task:
         metrics_task.cancel()
@@ -443,8 +625,15 @@ async def run_scenario(
     # Aggregate
     successful = [r for r in all_results if r.success]
     if not successful:
-        return {"error": "No successful requests", "total_requests": len(all_results),
-                "start_time": t_scenario_start, "end_time": t_scenario_end,
+        return {"scenario": scenario_name,
+                "concurrency": concurrency,
+                "context_tokens": ctx_len,
+                "total_requests": len(all_results),
+                "successful": 0,
+                "failed": len(all_results),
+                "error": "No successful requests",
+                "start_time": t_scenario_start,
+                "end_time": t_scenario_end,
                 "metrics_samples": metrics_samples}
 
     n = len(successful)
@@ -452,13 +641,27 @@ async def run_scenario(
     decode_stats = compute_stats([r.decode_ms for r in successful])
     e2e_stats = compute_stats([r.e2e_ms for r in successful])
 
+    # Reference-compatible metrics
+    times_s = [r.e2e_ms / 1000 for r in successful]
+    ttfts_s = [r.ttft_ms / 1000 for r in successful]
+    total_dur = t_scenario_end - t_scenario_start
+
     agg = {
         "scenario": scenario_name,
         "concurrency": concurrency,
         "context_tokens": ctx_len,
+        "num_batches": num_batches,
         "total_requests": len(all_results),
         "successful": n,
         "failed": len(all_results) - n,
+        # Reference-compatible metrics
+        "count": n,
+        "mean_time_s": round(sum(times_s) / n, 20),
+        "p50_time_s": round(sorted(times_s)[n // 2], 20),
+        "mean_ttft_s": round(sum(ttfts_s) / n, 20),
+        "total_tokens": sum(r.output_tokens for r in successful),
+        "throughput_req_per_s": round(n / total_dur, 10) if total_dur > 0 else 0,
+        # Detailed reproduction metrics
         "t_ttft_ms_mean": ttft_stats["mean"],
         "t_ttft_ms_p50": ttft_stats["p50"],
         "t_ttft_ms_p95": ttft_stats["p95"],
@@ -476,8 +679,6 @@ async def run_scenario(
         "t_e2e_ms_max": e2e_stats["max"],
         "total_output_tokens": sum(r.output_tokens for r in successful),
         "avg_output_tokens": round(sum(r.output_tokens for r in successful) / n, 10),
-        "throughput_req_per_s": round(n / (e2e_stats["mean"] / 1000 / n), 10)
-            if n > 0 else 0,
         "start_time": t_scenario_start,
         "end_time": t_scenario_end,
         "metrics_samples": metrics_samples,
@@ -489,15 +690,27 @@ async def run_scenario(
 # ---------------------------------------------------------------------------
 async def main():
     url = args.url.rstrip("/")
-    print(f"[06_loadgen] Load Generator")
-    print(f"[06_loadgen] Server: {url}")
+    completions_url = f"{url}/v1/chat/completions"
 
     if args.matrix:
-        runs = MATRIX
+        runs = REFERENCE_MATRIX
+        use_time_based = True
+        print(f"[06_loadgen] Load Generator (time-based, matching reference)")
         print(f"[06_loadgen] Full matrix: {len(runs)} scenarios")
+    elif args.duration > 0:
+        runs = [(f"custom_c{args.concurrency}_ctx{args.context}",
+                 args.concurrency, args.context, args.duration)]
+        use_time_based = True
+        print(f"[06_loadgen] Load Generator (time-based, matching reference)")
     else:
         runs = [(f"custom_c{args.concurrency}_ctx{args.context}",
-                 args.concurrency, args.context)]
+                 args.concurrency, args.context, 0)]
+        use_time_based = False
+        print(f"[06_loadgen] Load Generator (batch-based)")
+
+    print(f"[06_loadgen] Server: {url}")
+    print(f"[06_loadgen] Model:  {args.model}")
+    print(f"[06_loadgen] Output tokens: {args.output_tokens}")
 
     # GPU monitor (if enabled)
     gpu_monitor_proc = None
@@ -516,26 +729,45 @@ async def main():
 
     results = {}
     async with aiohttp.ClientSession() as session:
-        for scenario_name, concurrency, ctx_len in runs:
+        for scenario_name, concurrency, ctx_len, dur_or_batches in runs:
             print(f"\n{'─'*55}")
-            print(f"  Scenario: {scenario_name}  conc={concurrency}  ctx={ctx_len:,}")
+            if use_time_based:
+                print(f"  Scenario: {scenario_name}  conc={concurrency}  "
+                      f"ctx={ctx_len:,}  duration={dur_or_batches}s")
+            else:
+                print(f"  Scenario: {scenario_name}  conc={concurrency}  "
+                      f"ctx={ctx_len:,}  batches={args.num_batches}")
             print(f"{'─'*55}")
 
-            agg = await run_scenario(
-                session, url, args.model,
-                scenario_name, concurrency, ctx_len,
-                args.output_tokens,
-                args.num_batches, args.warmup_batches,
-                args.ramp_up_seconds, args.metrics_interval,
-                collect_metrics=True,
-            )
+            if use_time_based:
+                agg = await run_scenario_time_based(
+                    session, completions_url, args.model,
+                    scenario_name, concurrency, ctx_len,
+                    args.output_tokens, dur_or_batches,
+                    args.warmup_batches, args.ramp_up_seconds,
+                    args.metrics_interval,
+                    collect_metrics=True,
+                )
+            else:
+                agg = await run_scenario_batch(
+                    session, completions_url, args.model,
+                    scenario_name, concurrency, ctx_len,
+                    args.output_tokens, args.num_batches,
+                    args.warmup_batches, args.ramp_up_seconds,
+                    args.metrics_interval,
+                    collect_metrics=True,
+                )
             results[scenario_name] = agg
 
             if "error" not in agg:
-                print(f"    → avg TTFT={agg['t_ttft_ms_mean']:.0f}ms  "
-                      f"avg Decode={agg['t_decode_ms_mean']:.0f}ms  "
-                      f"avg E2E={agg['t_e2e_ms_mean']:.0f}ms  "
-                      f"p95={agg['t_e2e_ms_p95']:.0f}ms")
+                n = agg.get("successful", 0)
+                dur = agg.get("duration_s", agg.get("num_batches", "?"))
+                print(f"    → {n} successful, "
+                      f"mean TTFT={agg['t_ttft_ms_mean']:.0f}ms  "
+                      f"mean Decode={agg['t_decode_ms_mean']:.0f}ms  "
+                      f"mean E2E={agg['t_e2e_ms_mean']:.0f}ms  "
+                      f"p95 E2E={agg['t_e2e_ms_p95']:.0f}ms  "
+                      f"tput={agg['throughput_req_per_s']:.2f} req/s")
 
     # Stop GPU monitor
     gpu_stats_by_scenario = {}
@@ -566,7 +798,6 @@ async def main():
                 gpu_stats_by_scenario = correlate_gpu_to_scenarios(
                     gpu_samples, scenario_times
                 )
-                # Embed GPU stats into each scenario result
                 for scenario_name, gpu_stats in gpu_stats_by_scenario.items():
                     if scenario_name in results:
                         results[scenario_name]["gpu_stats"] = gpu_stats
@@ -577,16 +808,18 @@ async def main():
             print("[06_loadgen] WARNING: GPU monitor CSV not found")
 
     # Save
+    dispatch_mode = "time_based" if use_time_based else "batch"
     output = {
         "benchmark": "load_generator",
+        "dispatch_mode": dispatch_mode,
         "server_url": url,
         "model": args.model,
-        "num_batches": args.num_batches,
-        "warmup_batches": args.warmup_batches,
         "output_tokens_target": args.output_tokens,
+        "warmup_batches": args.warmup_batches,
         "ramp_up_seconds": args.ramp_up_seconds,
         "scenario_results": results,
         "gpu_monitor_enabled": args.gpu_monitor,
+        "matrix": REFERENCE_MATRIX if args.matrix else None,
     }
 
     out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
@@ -594,18 +827,20 @@ async def main():
 
     # Summary table
     has_gpu = any(r.get("gpu_stats") for r in results.values())
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 95)
     print("LOAD TEST SUMMARY")
-    print("=" * 90)
+    print("=" * 95)
     if has_gpu:
-        header = (f"{'Scenario':<16s} {'Conc':>4s} {'Ctx':>6s} {'N':>4s} "
-                  f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} {'tput':>8s} {'GPU%':>6s}")
+        header = (f"{'Scenario':<18s} {'Cnc':>3s} {'Ctx':>6s} {'N':>5s} "
+                  f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} "
+                  f"{'tput':>8s} {'GPU%':>6s}")
     else:
-        header = (f"{'Scenario':<16s} {'Conc':>4s} {'Ctx':>6s} {'N':>4s} "
-                  f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} {'tput':>8s}")
+        header = (f"{'Scenario':<18s} {'Cnc':>3s} {'Ctx':>6s} {'N':>5s} "
+                  f"{'TTFT':>8s} {'Decode':>8s} {'E2E':>8s} {'p95':>8s} "
+                  f"{'tput':>8s}")
     print(header)
-    print("-" * 90)
-    for scenario_name, _, _ in runs:
+    print("-" * 95)
+    for scenario_name, concurrency, ctx_len, _dur in runs:
         r = results.get(scenario_name, {})
         if r and "error" not in r:
             gpu_str = ""
@@ -613,13 +848,16 @@ async def main():
                 gs = r.get("gpu_stats", {})
                 gpu_avg = gs.get("overall_avg_utilization_pct", "-")
                 gpu_str = f"{gpu_avg:>5.0f}%" if isinstance(gpu_avg, (int, float)) else f"{str(gpu_avg):>6s}"
-            print(f"{scenario_name:<16s} {r['concurrency']:>4d} "
-                  f"{r['context_tokens']:>6,d} {r['successful']:>4d} "
+            print(f"{scenario_name:<18s} {r['concurrency']:>3d} "
+                  f"{r['context_tokens']:>6,d} {r['successful']:>5d} "
                   f"{r['t_ttft_ms_mean']:>7.0f}ms {r['t_decode_ms_mean']:>7.0f}ms "
                   f"{r['t_e2e_ms_mean']:>7.0f}ms {r['t_e2e_ms_p95']:>7.0f}ms "
                   f"{r['throughput_req_per_s']:>7.2f}/s"
                   + (f" {gpu_str}" if has_gpu else ""))
-    print("=" * 90)
+        elif r and "error" in r:
+            print(f"{scenario_name:<18s} {'—':>3s} {'—':>6s} "
+                  f"{r.get('total_requests', 0):>5d} {'ERROR: ' + r['error'][:50]}")
+    print("=" * 95)
 
 if __name__ == "__main__":
     asyncio.run(main())
