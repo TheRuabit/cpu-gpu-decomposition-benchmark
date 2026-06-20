@@ -25,6 +25,7 @@
 #   bash run_all.sh --phase 2 --url http://...  # Server tests
 #   bash run_all.sh --phase 4                # Analysis only
 #   bash run_all.sh --pilot                  # Small pilot run (1k/8k, conc=1)
+#   bash run_all.sh --output-tokens 128      # Override output token count (default: 64)
 # ==============================================================================
 
 set -euo pipefail
@@ -36,6 +37,7 @@ cd "$SCRIPT_DIR"
 PHASE="all"
 SERVER_URL="http://localhost:8000"
 MODEL="./models/Qwen3-30B-A3B"
+OUTPUT_TOKENS=64
 PILOT=false
 PYTHON="python"
 
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --phase) PHASE="$2"; shift 2 ;;
         --url) SERVER_URL="$2"; shift 2 ;;
         --model) MODEL="$2"; shift 2 ;;
+        --output-tokens) OUTPUT_TOKENS="$2"; shift 2 ;;
         --pilot) PILOT=true; shift ;;
         --python) PYTHON="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -64,10 +67,11 @@ mkdir -p result
 echo "============================================"
 echo " CPU-GPU Co-Design Benchmark Pipeline"
 echo "============================================"
-echo " Server:  $SERVER_URL"
-echo " Model:   $MODEL"
-echo " Phase:   $PHASE"
-echo " Pilot:   $PILOT"
+echo " Server:       $SERVER_URL"
+echo " Model:        $MODEL"
+echo " Phase:        $PHASE"
+echo " Pilot:        $PILOT"
+echo " Output Tokens: $OUTPUT_TOKENS"
 echo "============================================"
 echo ""
 
@@ -119,6 +123,7 @@ run_phase2() {
         echo "--- 04 HBM Prefix Cache Decomposition (pilot) ---"
         $PYTHON script/04_server_decomposition.py \
             --url "$SERVER_URL" --model "$MODEL" \
+            --output-tokens "$OUTPUT_TOKENS" \
             --scenarios $PILOT_SCENARIOS \
             --num-batches 2 --warmup-batches 1
         echo "  ✓ result/04_server_decomposition.json"
@@ -127,6 +132,7 @@ run_phase2() {
         echo "--- 03 Request Profiler (pilot) ---"
         $PYTHON script/03_request_profiler.py \
             --url "$SERVER_URL" --model "$MODEL" \
+            --output-tokens "$OUTPUT_TOKENS" \
             --context 1000 --concurrency 1 --num-batches 2
         echo "  ✓ result/03_request_profiler.json"
     else
@@ -134,6 +140,7 @@ run_phase2() {
         echo "--- 04 HBM Prefix Cache Decomposition ---"
         $PYTHON script/04_server_decomposition.py \
             --url "$SERVER_URL" --model "$MODEL" \
+            --output-tokens "$OUTPUT_TOKENS" \
             --num-batches 3 --warmup-batches 1
         echo "  ✓ result/04_server_decomposition.json"
 
@@ -148,6 +155,7 @@ run_phase2() {
         echo "--- 03 Request Profiler (full matrix) ---"
         $PYTHON script/03_request_profiler.py \
             --url "$SERVER_URL" --model "$MODEL" \
+            --output-tokens "$OUTPUT_TOKENS" \
             --matrix --num-batches 3
         echo "  ✓ result/03_request_profiler.json"
     fi
@@ -180,12 +188,14 @@ run_phase3() {
             echo "--- 05 LMCache Decomposition (pilot) ---"
             $PYTHON script/05_lmcache_decomposition.py \
                 --url "$SERVER_URL" --model "$MODEL" \
+                --output-tokens "$OUTPUT_TOKENS" \
                 --scenarios single_1k single_8k conc4_8k \
                 --num-batches 2 --warmup-batches 1
         else
             echo "--- 05 LMCache Decomposition ---"
             $PYTHON script/05_lmcache_decomposition.py \
                 --url "$SERVER_URL" --model "$MODEL" \
+                --output-tokens "$OUTPUT_TOKENS" \
                 --num-batches 3 --warmup-batches 1
         fi
         echo "  ✓ result/05_lmcache_decomposition.json"
@@ -194,6 +204,7 @@ run_phase3() {
         echo "--- 06 Load Generator (with GPU monitor) ---"
         $PYTHON script/06_load_generator.py \
             --url "$SERVER_URL" --model "$MODEL" \
+            --output-tokens "$OUTPUT_TOKENS" \
             --matrix --num-batches 3 --gpu-monitor
         echo "  ✓ result/06_load_generator.json"
     else
