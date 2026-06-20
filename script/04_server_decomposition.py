@@ -56,7 +56,7 @@ parser.add_argument("--model", default="./models/Qwen3-30B-A3B",
                     help="Model name for API requests")
 parser.add_argument("--output", default=None,
                     help="Output JSON path")
-parser.add_argument("--output-tokens", type=int, default=512,
+parser.add_argument("--output-tokens", type=int, default=64,
                     help="Max output tokens per request")
 parser.add_argument("--num-batches", type=int, default=3,
                     help="Number of measurement batches per scenario")
@@ -240,17 +240,21 @@ async def trace_one_request(
     t0 = time.perf_counter()
     body = json.dumps(payload, ensure_ascii=False)
     t.t_serialize_ms = (time.perf_counter() - t0) * 1000
+    
+    t_post = time.perf_counter()
 
     async with semaphore:
         try:
             t_first_byte = None
-            t_post = time.perf_counter()
+            
             async with session.post(
                 f"{url}/v1/chat/completions",
                 data=body,
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=600),
             ) as resp:
+                t_first_byte = time.perf_counter()
+                t.t_first_byte_ms = (t_first_byte - t_post) * 1000
                 if resp.status != 200:
                     err = await resp.text()
                     t.success = False
@@ -266,11 +270,12 @@ async def trace_one_request(
                 t_last_token = None
                 parse_start = None
                 token_count = 0
+                
+
 
                 async for line in resp.content:
                     if not first_byte:
-                        t_first_byte = time.perf_counter()
-                        t.t_first_byte_ms = (t_first_byte - t_post) * 1000
+                        
                         first_byte = True
                         parse_start = time.perf_counter()
 

@@ -53,7 +53,7 @@ parser.add_argument("--context", type=int, default=1000,
                     help="Target context length in tokens")
 parser.add_argument("--concurrency", type=int, default=1,
                     help="Number of concurrent requests")
-parser.add_argument("--output-tokens", type=int, default=512,
+parser.add_argument("--output-tokens", type=int, default=64,
                     help="Max output tokens per request")
 parser.add_argument("--num-batches", type=int, default=3,
                     help="Number of batches to run (for averaging)")
@@ -154,6 +154,7 @@ def get_context_text(target_tokens: int) -> str:
 
 def build_payload(context_text: str, model: str, max_tokens: int) -> dict:
     """Build an OpenAI-compatible chat completions request."""
+    
     return {
         "model": model,
         "messages": [
@@ -233,7 +234,6 @@ async def profile_single_request(
                         t_first_byte = time.perf_counter()
                         t.t_first_byte_ms = (t_first_byte - t_post) * 1000
                         first_byte_received = True
-                        parse_start = time.perf_counter()
 
                     line_str = line.decode("utf-8").strip()
                     if line_str.startswith("data: ") and line_str != "data: [DONE]":
@@ -252,8 +252,16 @@ async def profile_single_request(
                                     output_content += content
                         except json.JSONDecodeError:
                             pass
-
+                        
                 # ----- t_response_parse -----
+                parse_start = time.perf_counter()
+                try:
+                    # Attempt to parse as JSON (tool call scenario)
+                    _ = json.loads(output_content) if output_content.strip().startswith("{") else None
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                # Simulate structured output validation
+                _ = len(output_content.split())
                 t_parse_end = time.perf_counter()
                 if parse_start:
                     t.t_response_parse_ms = (t_parse_end - parse_start) * 1000
@@ -413,7 +421,7 @@ async def main():
         prefill_vals = [max(0, t.t_ttft_ms - t.t_first_byte_ms) for t in timings]
         prefill_stats = compute_stats(prefill_vals)
         # Derived: total = serialize + first_byte + decode (CPU + GPU)
-        total_vals = [t.t_serialize_ms + t.t_first_byte_ms + t.t_decode_ms for t in timings]
+        total_vals = [t.t_serialize_ms + max(t.t_first_byte_ms, t.t_ttft_ms) + t.t_decode_ms for t in timings]
         total_stats = compute_stats(total_vals)
         # CPU time = serialize + http_overhead
         cpu_vals = [t.t_serialize_ms + t.t_first_byte_ms for t in timings]

@@ -26,6 +26,7 @@ build/
 # Vibe setting
 .claude/
 CLAUDE.md
+Analysis.md
 
 # Jupyter
 .ipynb_checkpoints/
